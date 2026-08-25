@@ -21,10 +21,10 @@ use crate::service::download;
 use crate::service::download::Installable;
 use crate::service::profile::active_profile;
 use crate::service::workflow;
-use serde_yaml::{Mapping, Value};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use serde_yaml::{Mapping, Value};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use super::errors;
@@ -54,8 +54,10 @@ pub async fn install(app_handle: &AppHandle, ids: &[String]) -> Result<(), Strin
 
     // 单次读取预设并构建查找表，提升算法效率至 O(N)
     let presets = load_presets(app_handle);
-    let preset_map: HashMap<&str, &PreinstallPluginInfo> =
-        presets.iter().map(|p| (p.id.as_str(), p)).collect();
+    let preset_map: HashMap<&str, &PreinstallPluginInfo> = presets
+        .iter()
+        .map(|p| (p.id.as_str(), p))
+        .collect();
 
     let mut specs = Vec::with_capacity(ids.len());
     for id in ids {
@@ -80,10 +82,7 @@ pub async fn install(app_handle: &AppHandle, ids: &[String]) -> Result<(), Strin
         // 对账的 `expected`（bundled_dep_spec）一致。macOS/Linux 是直接
         // `spawnSync`（无 shell），spec 作为单个 argv 传递、空格天然保留，
         // 引号只会被当作包名字符导致安装失败（见 [`shell_quote_spec`]）。
-        let raw = normalize_git_spec(&preset_spec_for_install(
-            preset,
-            bundled_dir_of(app_handle, preset),
-        )?);
+        let raw = normalize_git_spec(&preset_spec_for_install(preset, bundled_dir_of(app_handle, preset))?);
         specs.push(shell_quote_spec(&raw));
     }
 
@@ -144,7 +143,13 @@ pub async fn install(app_handle: &AppHandle, ids: &[String]) -> Result<(), Strin
     // 后重试，直至成功或再无键可加（升级路径同样依赖该重试，见
     // [`run_plugin_with_allow_build_retry`]）。
     let (exit_code, last_output) = run_plugin_with_allow_build_retry(
-        app_handle, &node, &args, &cwd, &envs, &window, "install",
+        app_handle,
+        &node,
+        &args,
+        &cwd,
+        &envs,
+        &window,
+        "install",
     )
     .await?;
 
@@ -303,10 +308,7 @@ fn silent_install_failure_detail(missing: &[(String, PathBuf)], command_output: 
 ///
 /// 供本模块的安装/升级/卸载与 [`super::verify`] 的完整性修复共用：子进程（dsh
 /// 或 pnpm）都按同一套桌面端环境策略运行，保证 $DSH_HOME / PATH 布局一致。
-pub(crate) fn build_plugin_envs(
-    app_handle: &AppHandle,
-    prefer_bundled_pnpm: bool,
-) -> HashMap<String, String> {
+pub(crate) fn build_plugin_envs(app_handle: &AppHandle, prefer_bundled_pnpm: bool) -> HashMap<String, String> {
     let node = config::get_node_binary_path(app_handle);
     let bin_dir = cli::get_bin_dir(app_handle);
     let mut envs = HashMap::from([
@@ -374,7 +376,9 @@ async fn run_plugin_with_allow_build_retry(
         if !new_keys.is_empty() && retries < MAX_ALLOW_LIST_RETRIES {
             retries += 1;
             add_allow_build_keys(app_handle, &new_keys)?;
-            log::info!("pnpm allowBuilds updated with {new_keys:?}, retrying {action} ({retries})");
+            log::info!(
+                "pnpm allowBuilds updated with {new_keys:?}, retrying {action} ({retries})"
+            );
             let _ = window.emit(
                 PREINSTALL_LOG_EVENT,
                 PreinstallLogPayload {
@@ -403,24 +407,15 @@ async fn run_plugin_with_allow_build_retry(
 
 /// 升级单个插件：`dsh plugin --profile <当前档案> update <id>`
 pub async fn update(app_handle: &AppHandle, id: &str) -> Result<(), String> {
-    run_single_plugin_command(
-        app_handle,
-        id,
-        "update",
-        &["update".to_string(), id.to_string()],
-    )
-    .await
+    run_single_plugin_command(app_handle, id, "update", &["update".to_string(), id.to_string()])
+        .await
 }
 
 /// 卸载单个插件：`dsh plugin --profile <当前档案> remove <id>`
 pub async fn remove(app_handle: &AppHandle, id: &str) -> Result<(), String> {
-    let command_result = run_single_plugin_command(
-        app_handle,
-        id,
-        "remove",
-        &["remove".to_string(), id.to_string()],
-    )
-    .await;
+    let command_result =
+        run_single_plugin_command(app_handle, id, "remove", &["remove".to_string(), id.to_string()])
+            .await;
     // `dsh plugin remove` 以子进程退出码为准，可能出现「命令成功但插件仍在」的
     // 边界（如 bundle 层残留、pnpm 静默失败）；node_modules / lockfile 损坏时
     // （典型：安装只写入了 profile 清单而产物缺失，见 issue #90）pnpm 甚至会
@@ -504,9 +499,16 @@ async fn run_single_plugin_command(
 
     let cwd = config::get_dsh_install_path(app_handle);
     log::info!("Running dsh plugin {action} for {id}");
-    let (exit_code, output) =
-        run_plugin_with_allow_build_retry(app_handle, &node, &args, &cwd, &envs, &window, action)
-            .await?;
+    let (exit_code, output) = run_plugin_with_allow_build_retry(
+        app_handle,
+        &node,
+        &args,
+        &cwd,
+        &envs,
+        &window,
+        action,
+    )
+    .await?;
 
     if exit_code != 0 {
         log::error!("dsh plugin {action} failed for {id} with exit code {exit_code}");
@@ -638,9 +640,7 @@ async fn ensure_pnpm(app_handle: &AppHandle, window: &WebviewWindow) -> Result<b
             );
         }
         None => {
-            log::warn!(
-                "User pnpm version not detectable (broken/blocked shim?), using bundled pnpm"
-            );
+            log::warn!("User pnpm version not detectable (broken/blocked shim?), using bundled pnpm");
         }
     }
 
@@ -721,9 +721,9 @@ pub(crate) fn profile_store_major(app_handle: &AppHandle) -> Option<u32> {
 
 /// 从 `.modules.yaml` 文本解析 store 主版本（纯函数，便于单测）。
 fn parse_store_major_from_modules_yaml(content: &str) -> Option<u32> {
-    let store_dir = content
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("storeDir:").map(str::trim))?;
+    let store_dir = content.lines().find_map(|line| {
+        line.trim().strip_prefix("storeDir:").map(str::trim)
+    })?;
     // storeDir 形如 `C:\Users\xx\AppData\Local\pnpm\store\v10`，取末段 `v10` 的数字
     let major = store_dir
         .trim_matches(['"', '\''])
@@ -832,7 +832,8 @@ fn add_allow_build_keys(app_handle: &AppHandle, keys: &[String]) -> Result<(), S
     std::fs::create_dir_all(dir).map_err(|e| format!("PREINSTALL_MKDIR: {e}"))?;
 
     let content = if path.exists() {
-        std::fs::read_to_string(&path).map_err(|e| format!("PREINSTALL_READ_WORKSPACE: {e}"))?
+        std::fs::read_to_string(&path)
+            .map_err(|e| format!("PREINSTALL_READ_WORKSPACE: {e}"))?
     } else {
         // 与 dsh `initProfile` 生成的基础模板保持一致（尚无 allowBuilds）。
         "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n".to_string()
@@ -843,10 +844,7 @@ fn add_allow_build_keys(app_handle: &AppHandle, keys: &[String]) -> Result<(), S
         return Ok(()); // 无变化（所有键已就位），避免无意义写盘
     }
 
-    log::info!(
-        "pnpm-workspace.yaml rewritten with allowBuilds {keys:?} at {}",
-        path.display()
-    );
+    log::info!("pnpm-workspace.yaml rewritten with allowBuilds {keys:?} at {}", path.display());
     std::fs::write(&path, rendered).map_err(|e| format!("PREINSTALL_WRITE_WORKSPACE: {e}"))
 }
 
@@ -869,11 +867,14 @@ fn apply_allow_build_keys(content: &str, keys: &[String]) -> Result<String, Stri
         Err(first_err) => {
             let normalized = collapse_allow_builds_duplicates(content);
             if normalized == content {
-                return Err(format!("PREINSTALL_WORKSPACE_INVALID_YAML: {first_err}"));
+                return Err(format!(
+                    "PREINSTALL_WORKSPACE_INVALID_YAML: {first_err}"
+                ));
             }
             repaired = true;
-            serde_yaml::from_str(&normalized)
-                .map_err(|e| format!("PREINSTALL_WORKSPACE_INVALID_YAML: {e}"))?
+            serde_yaml::from_str(&normalized).map_err(|e| {
+                format!("PREINSTALL_WORKSPACE_INVALID_YAML: {e}")
+            })?
         }
     };
 
@@ -1036,8 +1037,7 @@ fn shell_quote_spec(spec: &str) -> String {
 /// 从 pnpm 失败输出里识别 git 传输层错误（区别于 allowBuilds 构建门禁），命中时
 /// 返回一句可读的成因/指引。pnpm 在这些场景下已经退到 git+ssh，再去补 allowBuilds
 /// 白名单是无效且误导的。
-fn git_transport_hint(output: &str) -> Option<&'static str> {
-    const SIGNALS: &[(&str, &str)] = &[
+fn git_transport_hint(output: &str) -> Option<&'static str> {    const SIGNALS: &[(&str, &str)] = &[
         (
             "host key verification failed",
             "git fell back to SSH and could not verify GitHub's host key (no known_hosts entry; the process ran non-interactively). Make sure GitHub is reachable over HTTPS.",
@@ -1091,13 +1091,8 @@ pub(crate) fn harness_prefer_bundled_pnpm(app_handle: &AppHandle) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_allow_build_keys, collapse_allow_builds_duplicates, extract_allow_line_key,
-        git_transport_hint, normalize_git_spec, parse_allowlist_keys,
-        parse_store_major_from_modules_yaml, preset_spec_for_install, shell_quote_spec,
-        silent_install_failure_detail, PreinstallPluginInfo,
-    };
     use std::path::PathBuf;
+    use super::{apply_allow_build_keys, collapse_allow_builds_duplicates, extract_allow_line_key, git_transport_hint, normalize_git_spec, parse_allowlist_keys, parse_store_major_from_modules_yaml, preset_spec_for_install, shell_quote_spec, silent_install_failure_detail, PreinstallPluginInfo};
 
     /// 构造预设条目的测试助手（internal 由各用例显式指定）
     fn preset(id: &str, spec: &str, internal: bool) -> PreinstallPluginInfo {
@@ -1120,7 +1115,10 @@ mod tests {
     fn install_spec_passthrough_for_regular_preset() {
         // 普通插件：spec 原样返回，与捆绑目录无关
         let p = preset("dshmarket", "dshmarket", false);
-        assert_eq!(preset_spec_for_install(&p, None).unwrap(), "dshmarket");
+        assert_eq!(
+            preset_spec_for_install(&p, None).unwrap(),
+            "dshmarket"
+        );
         assert_eq!(
             preset_spec_for_install(&p, Some(PathBuf::from("/ignored"))).unwrap(),
             "dshmarket"
@@ -1199,9 +1197,7 @@ virtualStoreDir: node_modules/.pnpm
     #[test]
     fn store_major_supports_unix_and_quoted_paths() {
         assert_eq!(
-            parse_store_major_from_modules_yaml(
-                "storeDir: /home/test/.local/share/pnpm/store/v11\n"
-            ),
+            parse_store_major_from_modules_yaml("storeDir: /home/test/.local/share/pnpm/store/v11\n"),
             Some(11)
         );
         assert_eq!(
@@ -1213,10 +1209,7 @@ virtualStoreDir: node_modules/.pnpm
     #[test]
     fn store_major_missing_when_no_store_dir() {
         // 档案尚未装过依赖：无 storeDir 段 → None
-        assert_eq!(
-            parse_store_major_from_modules_yaml("lockfileVersion: '9.0'\n"),
-            None
-        );
+        assert_eq!(parse_store_major_from_modules_yaml("lockfileVersion: '9.0'\n"), None);
         assert_eq!(parse_store_major_from_modules_yaml(""), None);
         assert_eq!(
             parse_store_major_from_modules_yaml("storeDir: C:\\Users\\x\\pnpm\\store\n"),
@@ -1234,10 +1227,7 @@ allowBuilds:
   dsh-better-sidebar@git+ssh://git@github.com/omdsh-dev/DSH-better-sidebar.git#6c89: true
 ";
         let keys = parse_allowlist_keys(out);
-        assert!(keys.contains(
-            &"dsh-better-sidebar@git+ssh://git@github.com/omdsh-dev/DSH-better-sidebar.git#6c89"
-                .to_string()
-        ));
+        assert!(keys.contains(&"dsh-better-sidebar@git+ssh://git@github.com/omdsh-dev/DSH-better-sidebar.git#6c89".to_string()));
         assert!(!keys.contains(&"dsh-better-sidebar".to_string()));
     }
 
@@ -1298,22 +1288,16 @@ allowBuilds:
 
     #[test]
     fn apply_quotes_git_dep_path_keys() {
-        let dep =
-            "dsh-better-sidebar@git+ssh://git@github.com/omdsh-dev/DSH-better-sidebar.git#6c89"
-                .to_string();
+        let dep = "dsh-better-sidebar@git+ssh://git@github.com/omdsh-dev/DSH-better-sidebar.git#6c89".to_string();
         // 空内容也能生成合法配置
         let out = apply_allow_build_keys("", &[dep.clone()]).unwrap();
         let map = allow_builds_map(&out);
-        assert_eq!(
-            map.get(&serde_yaml::Value::String(dep)),
-            Some(&serde_yaml::Value::Bool(true))
-        );
+        assert_eq!(map.get(&serde_yaml::Value::String(dep)), Some(&serde_yaml::Value::Bool(true)));
         // 库负责正确加引号，键原样（含 @ / : / #）可回读
         let doc: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
         assert_eq!(
             doc["allowBuilds"][&serde_yaml::Value::String(
-                "dsh-better-sidebar@git+ssh://git@github.com/omdsh-dev/DSH-better-sidebar.git#6c89"
-                    .to_string()
+                "dsh-better-sidebar@git+ssh://git@github.com/omdsh-dev/DSH-better-sidebar.git#6c89".to_string()
             )],
             serde_yaml::Value::Bool(true)
         );
@@ -1333,9 +1317,7 @@ allowBuilds:
         // 序列化后全局不允许再出现“重复键”的等价行（node-pty 只出现一次）
         let node_pty_keys = out
             .lines()
-            .filter(|l| {
-                l.trim_start().starts_with("node-pty") || l.trim_start().starts_with("'node-pty'")
-            })
+            .filter(|l| l.trim_start().starts_with("node-pty") || l.trim_start().starts_with("'node-pty'"))
             .count();
         assert_eq!(node_pty_keys, 1);
     }
@@ -1348,18 +1330,13 @@ allowBuilds:
         // 重复的 node-pty 只剩最后一个（值 true），同键不再重复
         let node_pty = normalized
             .lines()
-            .filter(|l| {
-                l.trim_start().starts_with("node-pty") || l.trim_start().starts_with("'node-pty'")
-            })
+            .filter(|l| l.trim_start().starts_with("node-pty") || l.trim_start().starts_with("'node-pty'"))
             .count();
         assert_eq!(node_pty, 1);
         assert!(normalized.contains("keep"));
         // 去重结果必须是合法 YAML，且能被后续解析
         let out = apply_allow_build_keys(&normalized, &["node-pty".to_string()]).unwrap();
-        assert_eq!(
-            allow_builds_map(&out).get("node-pty"),
-            Some(&serde_yaml::Value::Bool(true))
-        );
+        assert_eq!(allow_builds_map(&out).get("node-pty"), Some(&serde_yaml::Value::Bool(true)));
     }
 
     // ---- git GitHub 简写规范化（issue #51 根因绕行）----
@@ -1425,10 +1402,7 @@ allowBuilds:
             shell_quote_spec("link:/Applications/Deepseek Harness Desktop.app/Contents/Resources/resources/preset-plugins/dsh-tauri-ui"),
             "link:/Applications/Deepseek Harness Desktop.app/Contents/Resources/resources/preset-plugins/dsh-tauri-ui"
         );
-        assert_eq!(
-            shell_quote_spec("link:/Users/me/my plugins/dsh-tauri"),
-            "link:/Users/me/my plugins/dsh-tauri"
-        );
+        assert_eq!(shell_quote_spec("link:/Users/me/my plugins/dsh-tauri"), "link:/Users/me/my plugins/dsh-tauri");
     }
 
     #[test]
@@ -1450,8 +1424,7 @@ allowBuilds:
     #[test]
     fn shell_quote_preserves_link_prefix_semantics() {
         // 引号只包 path 部分也不影响 pnpm 解析（落盘值仍为不带引号的 link: 规范形）
-        let quoted =
-            shell_quote_spec("link:G:/Deepseek Harness Desktop/resources/preset-plugins/dsh-tauri");
+        let quoted = shell_quote_spec("link:G:/Deepseek Harness Desktop/resources/preset-plugins/dsh-tauri");
         assert!(quoted.starts_with('"'));
         assert!(quoted.ends_with('"'));
         assert!(quoted.contains("Deepseek Harness Desktop"));
@@ -1468,10 +1441,7 @@ allowBuilds:
     #[test]
     fn git_transport_hint_detects_publickey_and_ssh() {
         assert!(git_transport_hint("git@github.com: Permission denied (publickey)").is_some());
-        assert!(
-            git_transport_hint("ssh: connect to host github.com port 22: Connection refused")
-                .is_some()
-        );
+        assert!(git_transport_hint("ssh: connect to host github.com port 22: Connection refused").is_some());
     }
 
     #[test]
