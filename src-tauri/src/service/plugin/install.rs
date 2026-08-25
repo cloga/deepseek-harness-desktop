@@ -244,7 +244,8 @@ fn preset_spec_for_install(
 /// 存在：缺失者记录错误并整体返回 Err，避免前端误报「已安装 N 个插件」。
 ///
 /// 已落盘的插件同步清除其历史错误；`ids` 里未匹配到预设的条目忽略（调用处已先
-/// 校验过 ID，正常不可达）。
+/// 校验过 ID，正常不可达）。同时接收全部命令输出，以便静默失败时保留早期重试的
+/// 诊断，而不是因最后一次重试无输出而误报「子进程完全无输出」。
 fn verify_installed_products(
     app_handle: &AppHandle,
     ids: &[String],
@@ -352,12 +353,15 @@ pub(crate) fn build_plugin_envs(app_handle: &AppHandle, prefer_bundled_pnpm: boo
 /// `lib/index.js` 缺失」的坏态，下一次启动便因 `${DSH_HOME}/profiles/<档案>/node_modules/<pkg>/lib/index.js`
 /// 无法解析而 `ERR_MODULE_NOT_FOUND` 失败。
 ///
-/// 返回 `(退出码, 最后一次捕获的输出)`。输出仍逐行经 `preinstall-log` 实时推送。
+/// 返回 `(退出码, 所有尝试累积的输出)`，避免最后一次重试无输出时丢失此前诊断。
+/// 输出仍逐行经 `preinstall-log` 实时推送。
 ///
 /// 注意：pnpm v11 在 `allowBuilds` 将 git 托管插件（`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`）
 /// 或传递依赖（`ERR_PNPM_IGNORED_BUILDS`）拦截时仍可能以 **exit 0** 退出（假成功），
 /// 因此不能仅凭退出码判断成败——必须先解析输出里的 `allowBuilds` 键，有键就写入
 /// profile 的 `pnpm-workspace.yaml` 并重试。无键可加（或到达重试上限）才以本次退出码为准。
+///
+/// 每次重试的输出都必须累积，避免最终尝试无输出时覆盖此前真正有用的 pnpm 诊断。
 async fn run_plugin_with_allow_build_retry(
     app_handle: &AppHandle,
     node: &Path,
@@ -368,8 +372,10 @@ async fn run_plugin_with_allow_build_retry(
     action: &str,
 ) -> Result<(i32, String), String> {
     let mut retries = 0usize;
-    let (exit_code, last_output) = loop {
+    let mut all_output = String::new();
+    let exit_code = loop {
         let (code, captured) = run_plugin_process(node, args, cwd, envs, window).await?;
+        append_command_output(&mut all_output, &captured);
         let new_keys = parse_allowlist_keys(&captured);
         // 有可补充的 allowBuilds 键且未达上限 → 写入并重试（无论本次退出码是否为 0，
         // 见上方注释：pnpm 可能在阻断时仍以 0 退出）。
@@ -393,16 +399,27 @@ async fn run_plugin_with_allow_build_retry(
             log::error!(
                 "dsh plugin {action}: allowBuilds retry limit reached ({retries}), keys {new_keys:?} unresolved"
             );
-            break (if code == 0 { 1 } else { code }, captured);
+            break if code == 0 { 1 } else { code };
         }
         if code != 0 {
             log::error!(
                 "dsh plugin {action} failed with exit code {code}; no allowBuilds entries to add"
             );
         }
-        break (code, captured);
+        break code;
     };
-    Ok((exit_code, last_output))
+    Ok((exit_code, all_output))
+}
+
+/// 合并单次命令输出，并在相邻尝试之间补换行，保证后续错误解析不会粘连两段日志。
+fn append_command_output(all_output: &mut String, captured: &str) {
+    if captured.is_empty() {
+        return;
+    }
+    if !all_output.is_empty() && !all_output.ends_with('\n') {
+        all_output.push('\n');
+    }
+    all_output.push_str(captured);
 }
 
 /// 升级单个插件：`dsh plugin --profile <当前档案> update <id>`
@@ -1092,7 +1109,7 @@ pub(crate) fn harness_prefer_bundled_pnpm(app_handle: &AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use super::{apply_allow_build_keys, collapse_allow_builds_duplicates, extract_allow_line_key, git_transport_hint, normalize_git_spec, parse_allowlist_keys, parse_store_major_from_modules_yaml, preset_spec_for_install, shell_quote_spec, silent_install_failure_detail, PreinstallPluginInfo};
+    use super::{append_command_output, apply_allow_build_keys, collapse_allow_builds_duplicates, extract_allow_line_key, git_transport_hint, normalize_git_spec, parse_allowlist_keys, parse_store_major_from_modules_yaml, preset_spec_for_install, shell_quote_spec, silent_install_failure_detail, PreinstallPluginInfo};
 
     /// 构造预设条目的测试助手（internal 由各用例显式指定）
     fn preset(id: &str, spec: &str, internal: bool) -> PreinstallPluginInfo {
@@ -1146,6 +1163,7 @@ mod tests {
         assert!(err.contains("dsh-tauri"));
     }
 
+    /// 验证命令无输出且产物缺失时，会同时报告预期清单路径和可操作提示。
     #[test]
     fn silent_install_failure_reports_empty_output_and_expected_artifact() {
         let missing = vec![(
@@ -1164,6 +1182,7 @@ mod tests {
         assert!(detail.contains("Retry the installation"));
     }
 
+    /// 验证已有命令日志时，引导用户查看日志而不会误报为完全无输出。
     #[test]
     fn silent_install_failure_points_to_existing_command_log() {
         let missing = vec![(
@@ -1175,6 +1194,16 @@ mod tests {
 
         assert!(detail.contains("Review the preinstall log above"));
         assert!(!detail.contains("produced no output"));
+    }
+
+    /// 验证最终重试无输出时，早期尝试产生的诊断不会被覆盖丢失。
+    #[test]
+    fn command_output_retains_earlier_retry_diagnostics() {
+        let mut output = String::new();
+        append_command_output(&mut output, "ERR_PNPM_IGNORED_BUILDS");
+        append_command_output(&mut output, "");
+
+        assert_eq!(output, "ERR_PNPM_IGNORED_BUILDS");
     }
 
     #[test]

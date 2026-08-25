@@ -26,6 +26,9 @@ export async function pollReadiness({
 
   while (shouldContinue() && remainingAttempts !== 0) {
     const result = await probe()
+    if (!shouldContinue()) {
+      return { healthy: false, notOwned: false }
+    }
     if (remainingAttempts !== undefined) {
       remainingAttempts--
     }
