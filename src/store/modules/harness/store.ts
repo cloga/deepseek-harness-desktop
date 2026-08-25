@@ -18,7 +18,7 @@ import { listen } from '@tauri-apps/api/event'
 import i18next from 'i18next'
 import { defineStore } from 'valtio-define'
 import { queryClient } from '@/config/client'
-import { pickErrorLines } from '@/utils/log'
+import { containsInotifyLimitError, pickErrorLines } from '@/utils/log'
 import { pollReadiness } from '@/utils/readiness'
 import { harnessUpdater } from '../harness-updater'
 
@@ -33,6 +33,8 @@ interface StartupError extends Error {
   /** 完整清洗后的日志尾（供插件异常定位使用，非仅错误行） */
   logLines?: string[]
   pluginConflictHint?: string
+  /** Linux inotify 文件监视上限（ENOSPC）导致服务启动即崩溃时的针对性提示 */
+  inotifyLimitHint?: string
   /** 初始就绪窗口已耗尽，但后端进程仍由桌面端持有，可继续后台探测 */
   readinessTimedOut?: boolean
 }
@@ -133,6 +135,11 @@ async function attachStartupDiagnostics(err: unknown): Promise<StartupError> {
     if (lines.join('\n').includes('duplicate prefix route')) {
       startupError.pluginConflictHint = i18next.t('errors.plugin_route_conflict')
     }
+    // 识别 Linux inotify 文件监视上限（ENOSPC）：harness 服务启动即崩溃且用户无法直接解决，
+    // 需要系统级调高 fs.inotify.max_user_watches（见 errors.inotify_limit 文案）
+    if (containsInotifyLimitError(lines)) {
+      startupError.inotifyLimitHint = i18next.t('errors.inotify_limit')
+    }
   }
   return startupError as StartupError
 }
@@ -154,6 +161,8 @@ export const harness = defineStore({
     errorLogs: [] as string[],
     /** 识别到插件路由冲突时的针对性提示（Loadable children 展示） */
     pluginConflictHint: '',
+    /** 识别到 Linux inotify 文件监视上限（ENOSPC）时的针对性提示（Loadable children 展示） */
+    inotifyLimitHint: '',
     /** 插件异常修复界面状态（启动崩溃/运行期异常 → 弹出「卸除此插件并继续检测」） */
     recovery: initialRecovery,
     /** 用户已「暂不处理」的插件 id（避免同一运行期异常反复弹窗） */
@@ -278,6 +287,7 @@ export const harness = defineStore({
       this.errorMsg = ''
       this.errorLogs = []
       this.pluginConflictHint = ''
+      this.inotifyLimitHint = ''
       this.preinstall.error = ''
       // 服务（重）启动成功：清空插件异常修复态（若曾进入），并重置已「暂不处理」的插件
       this.recovery = { required: false, info: null, attempts: 0, busy: false }
@@ -329,6 +339,7 @@ export const harness = defineStore({
       this.errorMsg = ''
       this.errorLogs = []
       this.pluginConflictHint = ''
+      this.inotifyLimitHint = ''
       this.recovery = initialRecovery
       this.dismissedRecoveryIds = []
       this.serviceHealthy = false
@@ -380,6 +391,7 @@ export const harness = defineStore({
       this.errorMsg = ''
       this.errorLogs = []
       this.pluginConflictHint = ''
+      this.inotifyLimitHint = ''
       this.recovery = { required: false, info: null, attempts: this.recovery.attempts, busy: false }
       this.status = 'ready'
       let unlistenInstall: UnlistenFn | null = null
@@ -455,7 +467,13 @@ export const harness = defineStore({
         // 尝试从日志定位问题插件：能定位则弹出修复界面（全屏恢复页）
         await this.reviewStartupRecovery(startupError.logLines ?? startupError.logs ?? [])
         const keepServiceRunning = startupError.readinessTimedOut === true
-        this.fail(String(startupError), startupError.logs, startupError.pluginConflictHint, keepServiceRunning)
+        this.fail(
+          String(startupError),
+          startupError.logs,
+          startupError.pluginConflictHint,
+          startupError.inotifyLimitHint,
+          keepServiceRunning,
+        )
         if (keepServiceRunning) {
           void this.recoverReadiness(token)
         }
@@ -472,10 +490,11 @@ export const harness = defineStore({
     },
 
     /** 进入错误态（供本模块与 updater 模块共用） */
-    fail(message: string, logs?: string[], pluginConflictHint?: string, keepServiceRunning = false) {
+    fail(message: string, logs?: string[], pluginConflictHint?: string, inotifyLimitHint?: string, keepServiceRunning = false) {
       this.errorMsg = message
       this.errorLogs = logs ?? []
       this.pluginConflictHint = pluginConflictHint ?? ''
+      this.inotifyLimitHint = inotifyLimitHint ?? ''
       this.status = 'error'
       this.serviceRunning = keepServiceRunning
     },
@@ -594,6 +613,7 @@ export const harness = defineStore({
       this.errorMsg = i18next.t('ui.stopped')
       this.errorLogs = []
       this.pluginConflictHint = ''
+      this.inotifyLimitHint = ''
       this.recovery = initialRecovery
       this.dismissedRecoveryIds = []
     },
