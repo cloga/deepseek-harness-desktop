@@ -11,6 +11,7 @@ import type {
   SetupStatus,
   SidebarBusyAction,
 } from './types'
+import type { ReadinessProbeResult } from '@/utils/readiness'
 import { emitter } from '@hairy/react-lib'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
@@ -18,6 +19,7 @@ import i18next from 'i18next'
 import { defineStore } from 'valtio-define'
 import { queryClient } from '@/config/client'
 import { pickErrorLines } from '@/utils/log'
+import { pollReadiness } from '@/utils/readiness'
 import { harnessUpdater } from '../harness-updater'
 
 const MAX_RETRIES = 8
@@ -31,6 +33,8 @@ interface StartupError extends Error {
   /** 完整清洗后的日志尾（供插件异常定位使用，非仅错误行） */
   logLines?: string[]
   pluginConflictHint?: string
+  /** 初始就绪窗口已耗尽，但后端进程仍由桌面端持有，可继续后台探测 */
+  readinessTimedOut?: boolean
 }
 
 const initialInstaller: InstallerState = {
@@ -59,14 +63,8 @@ function generateTimestampedUrl(baseUrl: string): string {
   return `${baseUrl}${separator}t=${timestamp}`
 }
 
-/** 健康检查结果：healthy 表示服务就绪；notOwned 表示 dsh 进程已退出（启动即崩溃，快速失败信号） */
-interface HealthCheckResult {
-  healthy: boolean
-  notOwned: boolean
-}
-
 /** 通过 Rust 代理探测服务健康状态（超时 8s，网络抖动时重试） */
-async function checkHealthViaProxy(): Promise<HealthCheckResult> {
+async function checkHealthViaProxy(): Promise<ReadinessProbeResult> {
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error('health check timeout')), 8000)
@@ -266,8 +264,66 @@ export const harness = defineStore({
       })
     },
 
+    /** 服务探测通过后的统一收尾；token 用于阻止旧启动流程覆盖新状态 */
+    async completeReadiness(token?: number): Promise<boolean> {
+      const readyInfo = await invoke<{ service_url: string }>('get_runtime_info')
+      if (token !== undefined && token !== bootToken)
+        return false
+
+      this.serviceUrl = readyInfo.service_url
+      this.iframeSrc = generateTimestampedUrl(readyInfo.service_url)
+      this.serviceHealthy = true
+      this.serviceRunning = true
+      this.status = 'ready'
+      this.errorMsg = ''
+      this.errorLogs = []
+      this.pluginConflictHint = ''
+      this.preinstall.error = ''
+      // 服务（重）启动成功：清空插件异常修复态（若曾进入），并重置已「暂不处理」的插件
+      this.recovery = { required: false, info: null, attempts: 0, busy: false }
+      this.dismissedRecoveryIds = []
+      // 服务（重）启动成功后，dsh 版本/端口/CLI 链接状态等运行时信息可能已变化
+      // （典型：Harness 更新后旧版本缓存仍在，调试侧边栏需刷新页面才显示新版本）。
+      // 使侧边栏相关查询缓存失效，重新打开/已挂载时自动拉取最新值。
+      void queryClient.invalidateQueries({ queryKey: ['info'] })
+      void queryClient.invalidateQueries({ queryKey: ['config'] })
+      void queryClient.invalidateQueries({ queryKey: ['cli_status'] })
+      // 档案/核心切换后重启：当前档案的插件列表、核心来源状态一并刷新
+      void queryClient.invalidateQueries({ queryKey: ['plugins'] })
+      void queryClient.invalidateQueries({ queryKey: ['profiles'] })
+      void queryClient.invalidateQueries({ queryKey: ['cores'] })
+      return true
+    },
+
+    /**
+     * 初始就绪窗口超时后继续探测同一已持有进程。错误界面仍会及时出现，但只要后端
+     * 稍后完成插件加载，就自动恢复并挂载 iframe；新一轮 boot 会用 token 终止旧探测。
+     */
+    async recoverReadiness(token: number) {
+      const result = await pollReadiness({
+        probe: checkHealthViaProxy,
+        intervalMs: 2000,
+        shouldContinue: () => token === bootToken && this.serviceRunning && !this.serviceHealthy,
+      })
+      if (token !== bootToken)
+        return
+      if (result.notOwned) {
+        this.serviceRunning = false
+        return
+      }
+      if (!result.healthy)
+        return
+
+      try {
+        await this.completeReadiness(token)
+      }
+      catch (err) {
+        console.error('[Harness] failed to complete delayed readiness recovery:', err)
+      }
+    },
+
     /** 拉起服务并等待健康检查通过，通过后才允许挂载 iframe */
-    async launchAndWait() {
+    async launchAndWait(token?: number) {
       this.status = 'ready'
       this.installer = initialInstaller
       this.errorMsg = ''
@@ -286,42 +342,24 @@ export const harness = defineStore({
         this.serviceUrl = runtimeInfo.service_url
         this.iframeSrc = generateTimestampedUrl(runtimeInfo.service_url)
 
-        let healthy = false
-        let notOwned = false
-        for (let attempt = 0; attempt < MAX_RETRIES && !healthy && !notOwned; attempt++) {
-          const result = await checkHealthViaProxy()
-          healthy = result.healthy
-          notOwned = result.notOwned
-          if (!healthy && !notOwned) {
-            await new Promise(resolve => setTimeout(resolve, 2000))
-          }
-        }
-        if (!healthy) {
-          throw new Error(
+        const result = await pollReadiness({
+          probe: checkHealthViaProxy,
+          intervalMs: 2000,
+          maxAttempts: MAX_RETRIES,
+          shouldContinue: () => token === undefined || token === bootToken,
+        })
+        if (!result.healthy) {
+          const error: StartupError = new Error(
             i18next.t('errors.service_start_timeout', { port: new URL(this.serviceUrl).port || '3080' }),
           )
+          error.readinessTimedOut = !result.notOwned
+          throw error
         }
         // 服务已就绪后再取一次真实地址：`launch_harness` 可能因后端已在并发拉起
         // （auto_start）而提前返回，此刻端口若尚未落库，上面读到的 service_url 会是
         // 旧端口；健康检查通过意味着服务已在最终端口就绪，此时读取必然准确。
         // 避免 iframe 挂载到一个无人监听的地址（表现为首次加载失败、刷新后恢复）。
-        const readyInfo = await invoke<{ service_url: string }>('get_runtime_info')
-        this.serviceUrl = readyInfo.service_url
-        this.iframeSrc = generateTimestampedUrl(readyInfo.service_url)
-        this.serviceHealthy = true
-        // 服务（重）启动成功：清空插件异常修复态（若曾进入），并重置已「暂不处理」的插件
-        this.recovery = { required: false, info: null, attempts: 0, busy: false }
-        this.dismissedRecoveryIds = []
-        // 服务（重）启动成功后，dsh 版本/端口/CLI 链接状态等运行时信息可能已变化
-        // （典型：Harness 更新后旧版本缓存仍在，调试侧边栏需刷新页面才显示新版本）。
-        // 使侧边栏相关查询缓存失效，重新打开/已挂载时自动拉取最新值。
-        void queryClient.invalidateQueries({ queryKey: ['info'] })
-        void queryClient.invalidateQueries({ queryKey: ['config'] })
-        void queryClient.invalidateQueries({ queryKey: ['cli_status'] })
-        // 档案/核心切换后重启：当前档案的插件列表、核心来源状态一并刷新
-        void queryClient.invalidateQueries({ queryKey: ['plugins'] })
-        void queryClient.invalidateQueries({ queryKey: ['profiles'] })
-        void queryClient.invalidateQueries({ queryKey: ['cores'] })
+        await this.completeReadiness(token)
       }
       catch (err) {
         // 失败时附上服务日志里的真实错误行，供错误界面展示而不是只显示超时文案
@@ -400,7 +438,7 @@ export const harness = defineStore({
           return
         }
 
-        await this.launchAndWait()
+        await this.launchAndWait(token)
 
         if (token !== bootToken)
           return
@@ -416,7 +454,11 @@ export const harness = defineStore({
         const startupError = await attachStartupDiagnostics(err)
         // 尝试从日志定位问题插件：能定位则弹出修复界面（全屏恢复页）
         await this.reviewStartupRecovery(startupError.logLines ?? startupError.logs ?? [])
-        this.fail(String(startupError), startupError.logs, startupError.pluginConflictHint)
+        const keepServiceRunning = startupError.readinessTimedOut === true
+        this.fail(String(startupError), startupError.logs, startupError.pluginConflictHint, keepServiceRunning)
+        if (keepServiceRunning) {
+          void this.recoverReadiness(token)
+        }
       }
       finally {
         unlistenInstall?.()
@@ -430,12 +472,12 @@ export const harness = defineStore({
     },
 
     /** 进入错误态（供本模块与 updater 模块共用） */
-    fail(message: string, logs?: string[], pluginConflictHint?: string) {
+    fail(message: string, logs?: string[], pluginConflictHint?: string, keepServiceRunning = false) {
       this.errorMsg = message
       this.errorLogs = logs ?? []
       this.pluginConflictHint = pluginConflictHint ?? ''
       this.status = 'error'
-      this.serviceRunning = false
+      this.serviceRunning = keepServiceRunning
     },
 
     /**
@@ -632,6 +674,9 @@ export const harness = defineStore({
       catch (err) {
         console.error('[Harness] preinstall failed:', err)
         this.preinstall.error = String(err)
+        if (err instanceof Error && (err as StartupError).readinessTimedOut) {
+          void this.recoverReadiness(bootToken)
+        }
       }
       finally {
         unlisten?.()
