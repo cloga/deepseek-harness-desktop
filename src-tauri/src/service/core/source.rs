@@ -6,7 +6,7 @@
 
 use crate::config;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 
 use super::local::local_core;
@@ -64,12 +64,18 @@ pub struct HarnessCore {
 pub fn active_source(app_handle: &AppHandle) -> CoreSource {
     let setting = config::get_store_dat_setting(app_handle);
     let local_present = local_core(app_handle).is_some();
-    match setting.active_core.as_deref().and_then(CoreSource::parse) {
+    select_source(
+        setting.active_core.as_deref().and_then(CoreSource::parse),
+        local_present,
+    )
+}
+
+/// 显式选择本地核心时保持本地来源，即使安装在调用间隙消失也不静默借用内置核心。
+fn select_source(selected: Option<CoreSource>, local_present: bool) -> CoreSource {
+    match selected {
         Some(CoreSource::App) => CoreSource::App,
-        // 显式选择本地但本地已失效 → 回退预打包
-        Some(CoreSource::Local) if local_present => CoreSource::Local,
-        // 未设置（自动）或显式本地已失效：本地存在时优先
-        _ => {
+        Some(CoreSource::Local) => CoreSource::Local,
+        None => {
             if local_present {
                 CoreSource::Local
             } else {
@@ -82,14 +88,63 @@ pub fn active_source(app_handle: &AppHandle) -> CoreSource {
 /// 当前活动核心的 dsh 入口（bin.js 绝对路径）。
 ///
 /// 供服务启动（workflow::launch）与插件操作（plugin::install 等）统一取用，
-/// 本地核心解析在调用瞬间失效时回退预打包入口。
-pub fn active_dsh_binary(app_handle: &AppHandle) -> PathBuf {
+/// 显式本地核心解析失败时返回错误，禁止静默借用预打包核心。
+pub fn active_dsh_binary(app_handle: &AppHandle) -> Result<PathBuf, String> {
     match active_source(app_handle) {
         CoreSource::Local => local_core(app_handle)
             .map(|c| c.bin)
-            .unwrap_or_else(|| config::get_dsh_binary_path(app_handle)),
-        CoreSource::App => config::get_dsh_binary_path(app_handle),
+            .ok_or_else(|| "CORE_LOCAL_NOT_FOUND: selected local core is unavailable".to_string()),
+        CoreSource::App => Ok(config::get_dsh_binary_path(app_handle)),
     }
+}
+
+/// 从核心包或安装前缀解析同一核心树内的 `@deepseek-ai/<package>`。
+///
+/// 支持三种布局：
+/// - 预打包前缀：`<root>/node_modules/@deepseek-ai/<package>`；
+/// - 包内嵌套：`<dsh>/node_modules/@deepseek-ai/<package>`；
+/// - npm 扁平全局：`<prefix>/node_modules/@deepseek-ai/{dsh,<package>}`。
+pub(crate) fn resolve_core_package_dir(root: &Path, package: &str) -> Option<PathBuf> {
+    let nested = root.join("node_modules").join("@deepseek-ai").join(package);
+    if nested.join("package.json").is_file() {
+        return Some(nested);
+    }
+
+    let is_dsh_package = root.file_name().and_then(|name| name.to_str()) == Some("dsh")
+        && root
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("@deepseek-ai");
+    if is_dsh_package {
+        let sibling = root.parent()?.join(package);
+        if sibling.join("package.json").is_file() {
+            return Some(sibling);
+        }
+    }
+
+    None
+}
+
+/// 解析活动核心树内的包；本地来源解析失败时不回退到桌面端预打包目录。
+pub(crate) fn active_core_package_dir(
+    app_handle: &AppHandle,
+    package: &str,
+) -> Result<PathBuf, String> {
+    let root = match active_source(app_handle) {
+        CoreSource::Local => local_core(app_handle)
+            .map(|core| core.package_dir)
+            .ok_or_else(|| {
+                "CORE_LOCAL_NOT_FOUND: selected local core is unavailable".to_string()
+            })?,
+        CoreSource::App => config::get_dsh_install_path(app_handle),
+    };
+    resolve_core_package_dir(&root, package).ok_or_else(|| {
+        format!(
+            "CORE_PACKAGE_NOT_FOUND: @deepseek-ai/{package} is not installed under {}",
+            root.display()
+        )
+    })
 }
 
 /// 当前活动核心的版本号（`--no-open` 等按版本判定的能力以它为准）。
@@ -111,5 +166,89 @@ mod tests {
         assert_eq!(CoreSource::parse("other"), None);
         assert_eq!(CoreSource::Local.as_str(), "local");
         assert_eq!(CoreSource::App.as_str(), "app");
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-core-source-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn write_package(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"fixture"}"#).unwrap();
+    }
+
+    #[test]
+    fn explicit_local_selection_does_not_fall_back_to_app() {
+        assert_eq!(
+            select_source(Some(CoreSource::Local), false),
+            CoreSource::Local
+        );
+        assert_eq!(select_source(None, false), CoreSource::App);
+    }
+
+    #[test]
+    fn resolves_nested_package_layout() {
+        let root = temp_dir("nested");
+        let renderer = root
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh-client-ui-renderer");
+        write_package(&renderer);
+        assert_eq!(
+            resolve_core_package_dir(&root, "dsh-client-ui-renderer"),
+            Some(renderer)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolves_npm_flat_package_layout_from_selected_dsh() {
+        let scope = temp_dir("flat").join("node_modules").join("@deepseek-ai");
+        let dsh = scope.join("dsh");
+        let renderer = scope.join("dsh-client-ui-renderer");
+        write_package(&dsh);
+        write_package(&renderer);
+        assert_eq!(
+            resolve_core_package_dir(&dsh, "dsh-client-ui-renderer"),
+            Some(renderer)
+        );
+        let _ = std::fs::remove_dir_all(
+            scope
+                .ancestors()
+                .nth(2)
+                .expect("scope has node_modules parent"),
+        );
+    }
+
+    #[test]
+    fn packaged_core_resolution_stays_with_packaged_root() {
+        let packaged = temp_dir("packaged");
+        let unrelated = temp_dir("unrelated");
+        let workspace = packaged
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh-workspace");
+        write_package(&workspace);
+        write_package(
+            &unrelated
+                .join("node_modules")
+                .join("@deepseek-ai")
+                .join("dsh-workspace"),
+        );
+        assert_eq!(
+            resolve_core_package_dir(&packaged, "dsh-workspace"),
+            Some(workspace)
+        );
+        let _ = std::fs::remove_dir_all(packaged);
+        let _ = std::fs::remove_dir_all(unrelated);
     }
 }

@@ -1,6 +1,7 @@
 pub mod status;
 pub mod utils;
 pub(crate) mod client_hmr_patch;
+mod compat_patch;
 pub(crate) mod renderer_patch;
 pub(crate) mod workspace_patch;
 pub(crate) mod win_inspector;
@@ -622,7 +623,7 @@ pub async fn start(app_handle: tauri::AppHandle) -> Result<(), String> {
     let setting = config::get_store_dat_setting(&app_handle);
     let node_binary_path = config::get_node_binary_path(&app_handle);
     // 活动核心的入口：本地核心存在时优先本地（需求 3），否则预打包
-    let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle);
+    let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle)?;
 
     if !setting.installed {
         log::debug!("Harness not installed, skipping startup");
@@ -684,7 +685,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     let mut setting = config::get_store_dat_setting(&app_handle);
     let node_binary_path = config::get_node_binary_path(&app_handle);
     // 活动核心的 dsh 入口（本地核心优先，未检测到走预打包）
-    let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle);
+    let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle)?;
 
     log::debug!("Checking Node.js path: {:?}", node_binary_path);
     if !node_binary_path.exists() {
