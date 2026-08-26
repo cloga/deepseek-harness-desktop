@@ -91,7 +91,7 @@ pub async fn install(app_handle: &AppHandle, ids: &[String]) -> Result<(), Strin
 
     let node = config::get_node_binary_path(app_handle);
     // 活动核心的 dsh 入口：本地核心存在时用本地 CLI，否则预打包
-    let dsh_bin = core::active_dsh_binary(app_handle);
+    let dsh_bin = core::active_dsh_binary(app_handle)?;
     if !node.exists() {
         return Err("NODE_NOT_FOUND: Node.js runtime missing".to_string());
     }
@@ -439,7 +439,7 @@ async fn run_single_plugin_command(
     cli::ensure_shims(app_handle)?;
 
     let node = config::get_node_binary_path(app_handle);
-    let dsh_bin = core::active_dsh_binary(app_handle);
+    let dsh_bin = core::active_dsh_binary(app_handle)?;
     if !node.exists() {
         return Err("NODE_NOT_FOUND: Node.js runtime missing".to_string());
     }

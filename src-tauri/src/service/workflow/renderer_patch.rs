@@ -26,14 +26,17 @@
 //! 挂点：`service::workflow::launch` 启动 dsh 进程前，与 win_inspector / ensure_*
 //! 自愈链同一位置（最佳努力，失败只告警）。
 
-use std::fs;
 use std::path::PathBuf;
 
-use crate::config;
-use crate::service::core::{active_source, local_core_package_dir, CoreSource};
+use crate::service::core::active_core_package_dir;
+
+use super::compat_patch;
 
 /// 导出锚点的关键字（所在行的前导缩进随版本变化，不做硬编码）。
 const ANCHOR_KEYWORD: &str = "return module.exports;";
+const PATCH_MARKER: &str = "dsh-tauri-desktop: SlotOutlet compatibility export";
+const PATCHED_LINE: &str =
+    "exports.SlotOutlet = SlotOutlet; /* dsh-tauri-desktop: SlotOutlet compatibility export */";
 
 /// 单条 renderer client.js 内容的补丁结果。
 #[derive(Debug, PartialEq, Eq)]
@@ -52,14 +55,27 @@ enum PatchOutcome {
 /// 打包产物变化）插入同缩进的导出行——旧实现硬编码单 tab 锚点，upstream 产物
 /// 用双 tab 时会在字符串内部命中、插出缩进错乱的坏行。
 fn patch_source(source: &str) -> PatchOutcome {
-    if source.contains("exports.SlotOutlet") {
+    if source.contains(PATCH_MARKER) {
+        return if source.contains(PATCHED_LINE) {
+            PatchOutcome::AlreadyPatched
+        } else {
+            PatchOutcome::AnchorMissing
+        };
+    }
+    if source
+        .lines()
+        .any(|line| line.trim() == "exports.SlotOutlet = SlotOutlet;")
+    {
         return PatchOutcome::AlreadyPatched;
+    }
+    if source.match_indices(ANCHOR_KEYWORD).count() != 1 {
+        return PatchOutcome::AnchorMissing;
     }
     let Some((line_start, indent)) = locate_return_module_exports(source) else {
         return PatchOutcome::AnchorMissing;
     };
     let mut patched = source.to_string();
-    patched.insert_str(line_start, &format!("{indent}exports.SlotOutlet = SlotOutlet;\n"));
+    patched.insert_str(line_start, &format!("{indent}{PATCHED_LINE}\n"));
     PatchOutcome::Patched(patched)
 }
 
@@ -83,7 +99,7 @@ fn locate_return_module_exports(source: &str) -> Option<(usize, &str)> {
 /// 对活动核心的 dsh-client-ui-renderer `lib/client.js` 应用补丁（幂等）。
 /// 返回 Err 表示读/写失败；文件缺失、已打过、锚点变更均静默跳过（Ok）。
 pub fn apply(app_handle: &tauri::AppHandle) -> Result<(), String> {
-    let client_js: PathBuf = active_core_renderer_client_js(app_handle);
+    let client_js = active_core_renderer_client_js(app_handle)?;
     if !client_js.exists() {
         log::info!(
             "renderer client.js not found, skip SlotOutlet patch: {}",
@@ -91,7 +107,7 @@ pub fn apply(app_handle: &tauri::AppHandle) -> Result<(), String> {
         );
         return Ok(());
     }
-    let source = fs::read_to_string(&client_js)
+    let source = std::fs::read_to_string(&client_js)
         .map_err(|e| format!("RENDERER_PATCH_READ: {} failed: {e}", client_js.display()))?;
     match patch_source(&source) {
         PatchOutcome::AlreadyPatched => {
@@ -104,31 +120,20 @@ pub fn apply(app_handle: &tauri::AppHandle) -> Result<(), String> {
             );
         }
         PatchOutcome::Patched(patched) => {
-            fs::write(&client_js, patched).map_err(|e| {
-                format!("RENDERER_PATCH_WRITE: {} failed: {e}", client_js.display())
-            })?;
-            log::info!("renderer SlotOutlet export patched: {}", client_js.display());
+            compat_patch::write_with_backup(&client_js, &patched, "RENDERER_PATCH")?;
+            log::info!(
+                "renderer SlotOutlet export patched: {}",
+                client_js.display()
+            );
         }
     }
     Ok(())
 }
 
-/// 活动核心安装目录：本地核心用其包目录（全局安装路径），预打包用桌面端目录。
-///
-/// 与 [`crate::service::core::active_dsh_binary`] 的取舍一致——本地核心解析在
-/// 调用瞬间失效时回退预打包目录，绝不让旧实现那样恒打在一个不加载的文件上。
-fn active_core_install_dir(app_handle: &tauri::AppHandle) -> PathBuf {
-    match active_source(app_handle) {
-        CoreSource::Local => local_core_package_dir(app_handle)
-            .unwrap_or_else(|| config::get_dsh_install_path(app_handle)),
-        CoreSource::App => config::get_dsh_install_path(app_handle),
-    }
-}
-
 /// 活动核心 renderer 的 `lib/client.js` 路径。
-fn active_core_renderer_client_js(app_handle: &tauri::AppHandle) -> PathBuf {
-    active_core_install_dir(app_handle)
-        .join("node_modules/@deepseek-ai/dsh-client-ui-renderer/lib/client.js")
+fn active_core_renderer_client_js(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    active_core_package_dir(app_handle, "dsh-client-ui-renderer")
+        .map(|dir| dir.join("lib").join("client.js"))
 }
 
 #[cfg(test)]
@@ -145,9 +150,9 @@ mod tests {
     fn patch_inserts_export_before_return() {
         match patch_source(TAIL) {
             PatchOutcome::Patched(patched) => {
-                assert!(patched.contains("exports.SlotOutlet = SlotOutlet;"));
+                assert!(patched.contains(PATCHED_LINE));
                 assert!(patched.contains(
-                    "\t\texports.inject = inject;\n\texports.SlotOutlet = SlotOutlet;\n\treturn module.exports;\n"
+                    "\t\texports.inject = inject;\n\texports.SlotOutlet = SlotOutlet; /* dsh-tauri-desktop: SlotOutlet compatibility export */\n\treturn module.exports;\n"
                 ));
             }
             other => panic!("expected Patched, got {other:?}"),
@@ -161,7 +166,7 @@ mod tests {
         match patch_source(TAIL_DOUBLE_TAB) {
             PatchOutcome::Patched(patched) => {
                 assert!(patched.contains(
-                    "\t\texports.inject = inject;\n\t\texports.SlotOutlet = SlotOutlet;\n\t\treturn module.exports;\n"
+                    "\t\texports.inject = inject;\n\t\texports.SlotOutlet = SlotOutlet; /* dsh-tauri-desktop: SlotOutlet compatibility export */\n\t\treturn module.exports;\n"
                 ));
                 // 不产生把 return 缩进削掉一格的坏行
                 assert!(!patched.contains("\n\texports.SlotOutlet = SlotOutlet;\n\treturn"));
@@ -182,5 +187,17 @@ mod tests {
     fn patch_skips_when_anchor_missing() {
         let altered = "\t\texports.apply = apply;\n\t\texports.inject = inject;\n";
         assert_eq!(patch_source(altered), PatchOutcome::AnchorMissing);
+    }
+
+    #[test]
+    fn patch_refuses_incompatible_marker() {
+        let source = format!("/* {PATCH_MARKER} */\n{TAIL}");
+        assert_eq!(patch_source(&source), PatchOutcome::AnchorMissing);
+    }
+
+    #[test]
+    fn patch_refuses_ambiguous_anchor() {
+        let source = format!("{TAIL}\n{TAIL}");
+        assert_eq!(patch_source(&source), PatchOutcome::AnchorMissing);
     }
 }

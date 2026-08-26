@@ -5,21 +5,24 @@
 //! `cwd === workspace.path` 过滤，导致合法 worktree 会话只能落入“未分组”。本补丁仅
 //! 放宽显式 attach 后的归属保持；cwd 缺失、无法解析或不是目录的安全校验仍由上游保留。
 
-use std::fs;
-use std::path::PathBuf;
+use crate::service::core::active_core_package_dir;
 
-use crate::config;
-use crate::service::core::{active_source, local_core_package_dir, CoreSource};
+use super::compat_patch;
 
 // HARDCODE：以下锚点绑定内置 DSH 0.1.1-rc.2 的压缩后源码；锚点变化时安全跳过并告警。
-const PATCH_MARKER: &str = "dsh-tauri-worktree: relaxed explicit workspace membership";
+const PATCH_MARKER_PREFIX: &str = "dsh-tauri-worktree:";
+const GETTER_MARKER: &str = "dsh-tauri-worktree: relaxed workspace session getter";
+const ATTACH_MARKER: &str = "dsh-tauri-worktree: relaxed explicit workspace attach";
+const MUTATE_MARKER: &str = "dsh-tauri-worktree: relaxed workspace session mutation";
 const GETTER_ORIGINAL: &str =
     "return this.record.sessionIds.filter((id) => this.host.sessionPath(id) === this.record.path);";
-const GETTER_PATCHED: &str = "return this.record.sessionIds; /* dsh-tauri-worktree: relaxed explicit workspace membership */";
+const GETTER_PATCHED: &str =
+    "return this.record.sessionIds; /* dsh-tauri-worktree: relaxed workspace session getter */";
 const ATTACH_ORIGINAL: &str = "if (cwd !== this.record.path) throw new Error(`cannot attach session '${sessionId}' to workspace '${this.record.path}': its cwd resolves to '${cwd}'`);";
-const ATTACH_PATCHED: &str = "/* dsh-tauri-worktree: relaxed explicit workspace membership */";
+const ATTACH_PATCHED: &str =
+    "/* dsh-tauri-worktree: relaxed explicit workspace attach */";
 const MUTATE_ORIGINAL: &str = "const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) === changed.path);";
-const MUTATE_PATCHED: &str = "const sessionIds = changed.sessionIds; /* dsh-tauri-worktree: relaxed explicit workspace membership */";
+const MUTATE_PATCHED: &str = "const sessionIds = changed.sessionIds; /* dsh-tauri-worktree: relaxed workspace session mutation */";
 
 #[derive(Debug, PartialEq, Eq)]
 enum PatchOutcome {
@@ -29,8 +32,18 @@ enum PatchOutcome {
 }
 
 fn patch_source(source: &str) -> PatchOutcome {
-    if source.contains(PATCH_MARKER) {
-        return PatchOutcome::AlreadyPatched;
+    if source.contains(PATCH_MARKER_PREFIX) {
+        return if source.contains(GETTER_MARKER)
+            && source.contains(ATTACH_MARKER)
+            && source.contains(MUTATE_MARKER)
+            && source.contains(GETTER_PATCHED)
+            && source.contains(ATTACH_PATCHED)
+            && source.contains(MUTATE_PATCHED)
+        {
+            PatchOutcome::AlreadyPatched
+        } else {
+            PatchOutcome::AnchorMissing
+        };
     }
     if !source.contains(GETTER_ORIGINAL)
         || !source.contains(ATTACH_ORIGINAL)
@@ -46,8 +59,9 @@ fn patch_source(source: &str) -> PatchOutcome {
 }
 
 pub fn apply(app_handle: &tauri::AppHandle) -> Result<(), String> {
-    let workspace_js = active_core_install_dir(app_handle)
-        .join("node_modules/@deepseek-ai/dsh-workspace/lib/index.js");
+    let workspace_js = active_core_package_dir(app_handle, "dsh-workspace")?
+        .join("lib")
+        .join("index.js");
     if !workspace_js.exists() {
         log::info!(
             "workspace index.js not found, skip worktree membership patch: {}",
@@ -55,7 +69,7 @@ pub fn apply(app_handle: &tauri::AppHandle) -> Result<(), String> {
         );
         return Ok(());
     }
-    let source = fs::read_to_string(&workspace_js).map_err(|e| {
+    let source = std::fs::read_to_string(&workspace_js).map_err(|e| {
         format!(
             "WORKSPACE_PATCH_READ: {} failed: {e}",
             workspace_js.display()
@@ -70,12 +84,7 @@ pub fn apply(app_handle: &tauri::AppHandle) -> Result<(), String> {
             workspace_js.display()
         ),
         PatchOutcome::Patched(patched) => {
-            fs::write(&workspace_js, patched).map_err(|e| {
-                format!(
-                    "WORKSPACE_PATCH_WRITE: {} failed: {e}",
-                    workspace_js.display()
-                )
-            })?;
+            compat_patch::write_with_backup(&workspace_js, &patched, "WORKSPACE_PATCH")?;
             log::info!(
                 "workspace worktree membership patched: {}",
                 workspace_js.display()
@@ -83,14 +92,6 @@ pub fn apply(app_handle: &tauri::AppHandle) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn active_core_install_dir(app_handle: &tauri::AppHandle) -> PathBuf {
-    match active_source(app_handle) {
-        CoreSource::Local => local_core_package_dir(app_handle)
-            .unwrap_or_else(|| config::get_dsh_install_path(app_handle)),
-        CoreSource::App => config::get_dsh_install_path(app_handle),
-    }
 }
 
 #[cfg(test)]
@@ -125,5 +126,11 @@ mod tests {
     #[test]
     fn skips_partial_upstream_layout() {
         assert_eq!(patch_source(GETTER_ORIGINAL), PatchOutcome::AnchorMissing);
+    }
+
+    #[test]
+    fn refuses_incompatible_partial_marker() {
+        let source = format!("{GETTER_PATCHED}\n{MUTATE_PATCHED}\n");
+        assert_eq!(patch_source(&source), PatchOutcome::AnchorMissing);
     }
 }

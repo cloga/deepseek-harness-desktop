@@ -6,10 +6,8 @@
 //! 仍由 `/plugins/events` 精确触发，不轮询页面，也不会影响 release。
 
 use std::fs;
-use std::path::PathBuf;
 
-use crate::config;
-use crate::service::core::{active_source, local_core_package_dir, CoreSource};
+use crate::service::core::active_core_package_dir;
 
 // HARDCODE：以下锚点绑定内置 DSH 0.1.1-rc.2 的 client-HMR bundle；仅 debug 生效。
 const PATCH_MARKER: &str = "dsh-tauri-desktop: debug client plugin reload fallback";
@@ -44,8 +42,9 @@ fn patch_source(source: &str) -> PatchOutcome {
 /// debug 启动前把损坏的插件 hot-swap 降级为自动页面刷新。
 #[cfg(debug_assertions)]
 pub fn apply(app_handle: &tauri::AppHandle) -> Result<(), String> {
-    let client_js = active_core_install_dir(app_handle)
-        .join("node_modules/@deepseek-ai/dsh-client-hmr/lib/client.js");
+    let client_js = active_core_package_dir(app_handle, "dsh-client-hmr")?
+        .join("lib")
+        .join("client.js");
     if !client_js.exists() {
         log::info!(
             "client-hmr client.js not found, skip debug reload patch: {}",
@@ -83,14 +82,6 @@ pub fn apply(app_handle: &tauri::AppHandle) -> Result<(), String> {
 #[cfg(not(debug_assertions))]
 pub fn apply(_app_handle: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
-}
-
-fn active_core_install_dir(app_handle: &tauri::AppHandle) -> PathBuf {
-    match active_source(app_handle) {
-        CoreSource::Local => local_core_package_dir(app_handle)
-            .unwrap_or_else(|| config::get_dsh_install_path(app_handle)),
-        CoreSource::App => config::get_dsh_install_path(app_handle),
-    }
 }
 
 #[cfg(test)]
