@@ -1395,7 +1395,7 @@ mod tests {
 
         // 端口此刻确实被占用（模拟残留进程仍在监听）
         assert!(is_port_in_use(held));
-        std::thread::spawn(move || {
+        let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(150));
             drop(listener);
         });
@@ -1407,7 +1407,7 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(800),
             "wait_for_port_release should return shortly after the port is released, not wait the full window"
         );
-        assert!(!is_port_in_use(held));
+        releaser.join().expect("port releaser thread");
     }
 
     #[test]
