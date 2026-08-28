@@ -29,6 +29,7 @@ use crate::service::workflow;
 use serde_yaml::{Mapping, Value};
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
@@ -36,8 +37,8 @@ use super::errors;
 use super::installed::{installed_name, is_installed, profile_dir};
 use super::preset::{bundled_dep_spec, bundled_plugin_dir, load_presets, PreinstallPluginInfo};
 use super::process::{
-    acquire_process_lock, new_process_owner, run_plugin_process, PidGuard, PreinstallLogPayload,
-    ProcessOwner, PREINSTALL_LOG_EVENT,
+    acquire_operation_lock, acquire_process_lock, new_process_owner, run_plugin_process, PidGuard,
+    PreinstallLogPayload, ProcessOwner, PREINSTALL_LOG_EVENT,
 };
 use super::recovery::is_actionable_plugin_ref;
 use super::uninstall_recovery;
@@ -605,7 +606,7 @@ async fn run_plugin_with_allow_build_retry(
     cancel: Option<&tokio::sync::watch::Receiver<bool>>,
     owner: ProcessOwner,
 ) -> Result<(i32, String), String> {
-    let _process_guard = acquire_process_lock().await;
+    let _operation_guard = acquire_operation_lock().await;
     let mut retries = 0usize;
     let mut all_output = String::new();
     let exit_code = loop {
@@ -989,6 +990,7 @@ async fn user_pnpm_major_version_bounded(
         command.process_group(0);
     }
 
+    let process_guard = acquire_process_lock().await;
     let child = match command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1006,33 +1008,137 @@ async fn user_pnpm_major_version_bounded(
     let pid = child.id();
     let pid_guard = PidGuard::set(owner, pid);
     let mut waiter = tauri::async_runtime::spawn_blocking(move || {
+        let _process_guard = process_guard;
         let _pid_guard = pid_guard;
-        child.wait_with_output()
+        wait_for_probe_output(child)
     });
 
     let output = match tokio::time::timeout(PNPM_PROBE_TIMEOUT, &mut waiter).await {
-        Ok(joined) => joined
-            .map_err(|e| format!("PNPM_PROBE_WAIT_FAILED: {e}"))?
-            .map_err(|e| format!("PNPM_PROBE_OUTPUT_FAILED: {e}"))?,
+        Ok(Ok(waited)) => match probe_output_or_fallback(&pnpm, waited)? {
+            Some(output) => output,
+            None => return Ok(None),
+        },
+        Ok(Err(error)) => {
+            return Err(format!(
+                "PNPM_PROBE_WAIT_TASK_FAILED: pnpm version probe wait task failed: {error}"
+            ));
+        }
         Err(_) => {
-            log::warn!(
+            let reason = format!(
                 "PNPM_PROBE_TIMEOUT: pnpm version probe exceeded {} seconds",
                 PNPM_PROBE_TIMEOUT.as_secs()
             );
+            log::error!("{reason}");
             super::cancel::terminate_owned_install(owner).await;
-            let joined = tokio::time::timeout(PNPM_PROBE_CLEANUP_TIMEOUT, &mut waiter)
+            let cleanup = tokio::time::timeout(PNPM_PROBE_CLEANUP_TIMEOUT, &mut waiter)
                 .await
                 .map_err(|_| {
                     "PNPM_PROBE_CLEANUP_TIMEOUT: pnpm version probe did not exit after forced termination"
                         .to_string()
                 })?;
-            joined
-                .map_err(|e| format!("PNPM_PROBE_WAIT_FAILED: {e}"))?
-                .map_err(|e| format!("PNPM_PROBE_OUTPUT_FAILED: {e}"))?;
-            return Ok(None);
+            match cleanup {
+                Ok(Ok(_)) | Ok(Err(_)) => return Err(reason),
+                Err(error) => {
+                    return Err(format!(
+                        "PNPM_PROBE_CLEANUP_FAILED: pnpm version probe wait task failed during cleanup: {error}"
+                    ));
+                }
+            }
         }
     };
     Ok(parse_pnpm_major_output(&pnpm, &output))
+}
+
+fn wait_for_probe_output(mut child: std::process::Child) -> std::io::Result<std::process::Output> {
+    let pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = std::thread::Builder::new()
+        .name("pnpm-probe-stdout".to_string())
+        .spawn(move || read_probe_pipe(stdout))
+        .map_err(|error| reap_probe_after_wait_failure(&mut child, pid, error))?;
+    let stderr_reader = std::thread::Builder::new()
+        .name("pnpm-probe-stderr".to_string())
+        .spawn(move || read_probe_pipe(stderr))
+        .map_err(|error| reap_probe_after_wait_failure(&mut child, pid, error))?;
+
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => return Err(reap_probe_after_wait_failure(&mut child, pid, error)),
+    };
+    let stdout = join_probe_reader(stdout_reader)?;
+    let stderr = join_probe_reader(stderr_reader)?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn reap_probe_after_wait_failure(
+    child: &mut std::process::Child,
+    pid: u32,
+    error: std::io::Error,
+) -> std::io::Error {
+    super::cancel::terminate_pid_tree(pid);
+    match child.try_wait() {
+        Ok(Some(_)) => return error,
+        Ok(None) => {
+            if let Err(kill_error) = child.kill() {
+                log::warn!("pnpm version probe kill after wait failure failed: {kill_error}");
+            }
+        }
+        Err(cleanup_error) => {
+            log::warn!(
+                "pnpm version probe status check after wait failure failed: {cleanup_error}"
+            );
+        }
+    }
+    loop {
+        match child.wait() {
+            Ok(_) => return error,
+            Err(cleanup_error) => {
+                log::warn!("pnpm version probe reap after wait failure failed: {cleanup_error}");
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+fn read_probe_pipe<R: Read>(pipe: Option<R>) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut output)?;
+    }
+    Ok(output)
+}
+
+fn join_probe_reader(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| std::io::Error::other("pnpm version probe output reader thread panicked"))?
+}
+
+fn log_probe_fallback(pnpm: &Path, phase: &str, error: impl std::fmt::Display) {
+    log::warn!(
+        "pnpm version probe {phase} failed for {}: {error}; falling back to bundled pnpm",
+        pnpm.display()
+    );
+}
+
+fn probe_output_or_fallback(
+    pnpm: &Path,
+    result: std::io::Result<std::process::Output>,
+) -> Result<Option<std::process::Output>, String> {
+    match result {
+        Ok(output) => Ok(Some(output)),
+        Err(error) => {
+            log_probe_fallback(pnpm, "output", error);
+            Ok(None)
+        }
+    }
 }
 
 /// 用户 pnpm 主版本号（解析 `pnpm --version` 首个点分字段）；不存在或不可运行
@@ -1659,10 +1765,42 @@ mod tests {
         dep_path_to_name, diagnostic_suffix, extract_allow_line_key, extract_only_builds_git_name,
         git_transport_hint, has_github_ssh_rewrite_in_output, normalize_git_spec,
         parse_allowlist_keys, parse_store_major_from_modules_yaml, preset_spec_for_install,
-        rewrite_rule_targets_ssh_github, shell_quote_spec, silent_install_failure_detail,
-        PreinstallPluginInfo,
+        probe_output_or_fallback, read_probe_pipe, rewrite_rule_targets_ssh_github,
+        shell_quote_spec, silent_install_failure_detail, PreinstallPluginInfo,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn pnpm_probe_wait_and_output_failures_fall_back_to_bundled() {
+        let pnpm = PathBuf::from("broken-pnpm");
+        let output = probe_output_or_fallback(
+            &pnpm,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "output pipe closed",
+            )),
+        )
+        .unwrap();
+
+        assert!(output.is_none());
+    }
+
+    struct BrokenPipeReader;
+
+    impl std::io::Read for BrokenPipeReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "probe output pipe closed",
+            ))
+        }
+    }
+
+    #[test]
+    fn pnpm_probe_broken_output_pipe_is_reported_as_fallback_failure() {
+        let error = read_probe_pipe(Some(BrokenPipeReader)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
 
     #[cfg(unix)]
     #[test]

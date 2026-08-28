@@ -40,6 +40,7 @@ pub(crate) struct ProcessOwner(u64);
 static NEXT_PROCESS_OWNER: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_PLUGIN_PIDS: OnceLock<Mutex<HashMap<ProcessOwner, u32>>> = OnceLock::new();
 static PLUGIN_PROCESS_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+static PLUGIN_OPERATION_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 
 fn active_pid_lock() -> &'static Mutex<HashMap<ProcessOwner, u32>> {
     ACTIVE_PLUGIN_PIDS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -68,6 +69,14 @@ pub(crate) fn active_plugin_processes() -> Vec<(ProcessOwner, u32)> {
 
 pub(crate) async fn acquire_process_lock() -> tokio::sync::OwnedMutexGuard<()> {
     PLUGIN_PROCESS_LOCK
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await
+}
+
+pub(crate) async fn acquire_operation_lock() -> tokio::sync::OwnedMutexGuard<()> {
+    PLUGIN_OPERATION_LOCK
         .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
         .lock_owned()
@@ -122,6 +131,7 @@ pub(crate) async fn run_plugin_process(
     window: &WebviewWindow,
     owner: ProcessOwner,
 ) -> Result<(i32, String), String> {
+    let process_guard = acquire_process_lock().await;
     let captured = Arc::new(Mutex::new(String::new()));
 
     #[cfg(windows)]
@@ -137,6 +147,7 @@ pub(crate) async fn run_plugin_process(
 
         let handle = WaitableHandle(handle);
         let exit_code = tauri::async_runtime::spawn_blocking(move || {
+            let _process_guard = process_guard;
             let _pid_guard = pid_guard;
             use windows_sys::Win32::Foundation::CloseHandle;
             use windows_sys::Win32::System::Threading::{
@@ -190,6 +201,7 @@ pub(crate) async fn run_plugin_process(
         }
 
         let exit_code = tauri::async_runtime::spawn_blocking(move || {
+            let _process_guard = process_guard;
             let _pid_guard = pid_guard;
             child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
         })
