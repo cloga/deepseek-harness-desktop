@@ -41,9 +41,16 @@ static NEXT_PROCESS_OWNER: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_PLUGIN_PIDS: OnceLock<Mutex<HashMap<ProcessOwner, u32>>> = OnceLock::new();
 static PLUGIN_PROCESS_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 static PLUGIN_OPERATION_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+static PLUGIN_CLEANUP_FAILURE: OnceLock<
+    tokio::sync::watch::Sender<Option<(ProcessOwner, String)>>,
+> = OnceLock::new();
 
 fn active_pid_lock() -> &'static Mutex<HashMap<ProcessOwner, u32>> {
     ACTIVE_PLUGIN_PIDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cleanup_failure_sender() -> &'static tokio::sync::watch::Sender<Option<(ProcessOwner, String)>> {
+    PLUGIN_CLEANUP_FAILURE.get_or_init(|| tokio::sync::watch::channel(None).0)
 }
 
 pub(crate) fn new_process_owner() -> ProcessOwner {
@@ -67,12 +74,77 @@ pub(crate) fn active_plugin_processes() -> Vec<(ProcessOwner, u32)> {
         .collect()
 }
 
-pub(crate) async fn acquire_process_lock() -> tokio::sync::OwnedMutexGuard<()> {
-    PLUGIN_PROCESS_LOCK
+#[cfg(windows)]
+pub(crate) fn plugin_process_has_exited(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(87);
+    }
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    wait == 0
+}
+
+#[cfg(not(windows))]
+pub(crate) fn plugin_process_has_exited(pid: u32) -> bool {
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    if waited == pid as libc::pid_t {
+        return true;
+    }
+    if waited == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+pub(crate) fn mark_process_cleanup_failed(owner: ProcessOwner, reason: String) {
+    cleanup_failure_sender().send_replace(Some((owner, reason)));
+}
+
+pub(crate) fn clear_process_cleanup_failed(owner: ProcessOwner) {
+    cleanup_failure_sender().send_if_modified(|failure| {
+        if failure.as_ref().is_some_and(|(active, _)| *active == owner) {
+            *failure = None;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+pub(crate) async fn acquire_process_lock() -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let lock = PLUGIN_PROCESS_LOCK
         .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-        .lock_owned()
-        .await
+        .clone();
+    let mut cleanup_failure = cleanup_failure_sender().subscribe();
+    loop {
+        if let Some((_, reason)) = cleanup_failure.borrow().as_ref() {
+            return Err(reason.clone());
+        }
+        tokio::select! {
+            guard = lock.clone().lock_owned() => {
+                if let Some((_, reason)) = cleanup_failure.borrow().as_ref() {
+                    drop(guard);
+                    return Err(reason.clone());
+                }
+                return Ok(guard);
+            }
+            changed = cleanup_failure.changed() => {
+                if changed.is_err() {
+                    return Err(
+                        "PLUGIN_PROCESS_COORDINATOR_DROPPED: cleanup coordinator ended unexpectedly"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
 }
 
 pub(crate) async fn acquire_operation_lock() -> tokio::sync::OwnedMutexGuard<()> {
@@ -131,7 +203,7 @@ pub(crate) async fn run_plugin_process(
     window: &WebviewWindow,
     owner: ProcessOwner,
 ) -> Result<(i32, String), String> {
-    let process_guard = acquire_process_lock().await;
+    let process_guard = acquire_process_lock().await?;
     let captured = Arc::new(Mutex::new(String::new()));
 
     #[cfg(windows)]
@@ -262,5 +334,20 @@ mod tests {
 
         drop(current);
         assert_eq!(active_plugin_pid(owner), None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_wakes_waiters_and_releases_after_owner_clears() {
+        let guard = acquire_process_lock().await.unwrap();
+        let owner = new_process_owner();
+        let reason = "PLUGIN_PROCESS_CLEANUP_FAILED: test process is still active".to_string();
+        let waiter = tokio::spawn(acquire_process_lock());
+
+        mark_process_cleanup_failed(owner, reason.clone());
+        assert_eq!(waiter.await.unwrap().unwrap_err(), reason);
+
+        clear_process_cleanup_failed(owner);
+        drop(guard);
+        assert!(acquire_process_lock().await.is_ok());
     }
 }
