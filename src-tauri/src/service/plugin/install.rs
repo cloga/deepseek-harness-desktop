@@ -1149,6 +1149,20 @@ struct ProbeCleanupPending {
     _pid_guard: PidGuard,
 }
 
+impl ProbeCleanupPending {
+    fn release(self) {
+        let Self {
+            child,
+            owner,
+            _process_guard,
+            _pid_guard,
+            ..
+        } = self;
+        super::process::release_process_cleanup(owner, _pid_guard, _process_guard);
+        drop(child);
+    }
+}
+
 fn wait_for_probe_output(child: &mut std::process::Child) -> ProbeWaitResult {
     let pid = child.id();
     let stdout = child.stdout.take();
@@ -1224,9 +1238,7 @@ fn monitor_probe_cleanup(mut pending: ProbeCleanupPending) {
     super::process::mark_process_cleanup_failed(pending.owner, pending.reason.clone());
     tauri::async_runtime::spawn(async move {
         wait_for_probe_cleanup(&mut pending).await;
-        let owner = pending.owner;
-        drop(pending);
-        super::process::clear_process_cleanup_failed(owner);
+        pending.release();
     });
 }
 
@@ -1251,11 +1263,10 @@ fn monitor_probe_wait_task(
                     _pid_guard: pid_guard,
                 };
                 wait_for_probe_cleanup(&mut pending).await;
-                drop(pending);
+                pending.release();
             }
             Ok(ProbeTaskResult::Finished(_)) => {
-                drop(process_guard);
-                drop(pid_guard);
+                super::process::release_process_cleanup(owner, pid_guard, process_guard);
             }
             Err(error) => {
                 log::error!("pnpm version probe cleanup wait task failed: {error}");
@@ -1264,11 +1275,9 @@ fn monitor_probe_wait_task(
                     PNPM_PROBE_LIVENESS_INTERVAL,
                 )
                 .await;
-                drop(process_guard);
-                drop(pid_guard);
+                super::process::release_process_cleanup(owner, pid_guard, process_guard);
             }
         }
-        super::process::clear_process_cleanup_failed(owner);
     });
 }
 
@@ -1287,9 +1296,7 @@ fn monitor_orphaned_probe_pid(
             PNPM_PROBE_LIVENESS_INTERVAL,
         )
         .await;
-        drop(process_guard);
-        drop(pid_guard);
-        super::process::clear_process_cleanup_failed(owner);
+        super::process::release_process_cleanup(owner, pid_guard, process_guard);
     });
 }
 

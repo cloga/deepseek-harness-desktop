@@ -125,6 +125,16 @@ pub(crate) fn clear_process_cleanup_failed(owner: ProcessOwner) {
     });
 }
 
+pub(crate) fn release_process_cleanup(
+    owner: ProcessOwner,
+    pid_guard: PidGuard,
+    process_guard: tokio::sync::OwnedMutexGuard<()>,
+) {
+    clear_process_cleanup_failed(owner);
+    drop(pid_guard);
+    drop(process_guard);
+}
+
 pub(crate) async fn acquire_process_lock() -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
     let lock = PLUGIN_PROCESS_LOCK
         .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -344,17 +354,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_failure_wakes_waiters_and_releases_after_owner_clears() {
+    async fn cleanup_failure_clears_before_lock_handoff_and_preserves_other_owner() {
         let guard = acquire_process_lock().await.unwrap();
         let owner = new_process_owner();
+        let pid_guard = PidGuard::set(owner, 100);
         let reason = "PLUGIN_PROCESS_CLEANUP_FAILED: test process is still active".to_string();
-        let waiter = tokio::spawn(acquire_process_lock());
-
         mark_process_cleanup_failed(owner, reason.clone());
+
+        let waiter = tokio::spawn(acquire_process_lock());
+        tokio::task::yield_now().await;
+        assert!(
+            waiter.is_finished(),
+            "active cleanup failure should wake a queued waiter"
+        );
         assert_eq!(waiter.await.unwrap().unwrap_err(), reason);
 
         clear_process_cleanup_failed(owner);
+        let handoff = tokio::spawn(acquire_process_lock());
+        tokio::task::yield_now().await;
+        assert!(
+            !handoff.is_finished(),
+            "waiter should queue after failure clears while guard remains held"
+        );
+        drop(pid_guard);
         drop(guard);
-        assert!(acquire_process_lock().await.is_ok());
+        assert!(handoff.await.unwrap().is_ok());
+        assert_eq!(active_plugin_pid(owner), None);
+
+        let guard = acquire_process_lock().await.unwrap();
+        let other_owner = new_process_owner();
+        let stale_pid_guard = PidGuard::set(owner, 101);
+        let other_reason =
+            "PLUGIN_PROCESS_CLEANUP_FAILED: another owner is still active".to_string();
+        mark_process_cleanup_failed(other_owner, other_reason.clone());
+        release_process_cleanup(owner, stale_pid_guard, guard);
+
+        assert_eq!(
+            acquire_process_lock().await.unwrap_err(),
+            other_reason,
+            "clearing a stale owner must not remove another owner's failure"
+        );
+        clear_process_cleanup_failed(other_owner);
     }
 }
