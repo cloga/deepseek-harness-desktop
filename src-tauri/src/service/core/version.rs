@@ -49,7 +49,7 @@ fn safe_slot_path(deps: &Path, tag: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// 预打包目录内实际传给 Node.js 的 dsh 入口。
+/// 统一解析预打包入口，避免不同列表分支把目录误报为可执行入口。
 fn app_binary_path(dir: &Path) -> PathBuf {
     dir.join(config::DSH_ENTRY_RELATIVE)
 }
@@ -196,11 +196,15 @@ pub async fn list(app_handle: &AppHandle) -> Vec<HarnessCore> {
             slot.is_some()
         };
         let (path, dir) = if is_active || is_installed {
-            let s = active_dir.to_string_lossy().into_owned();
-            (s.clone(), s)
+            (
+                app_binary_path(&active_dir).to_string_lossy().into_owned(),
+                active_dir.to_string_lossy().into_owned(),
+            )
         } else if let Some(slot) = slot {
-            let s = slot.to_string_lossy().into_owned();
-            (s.clone(), s)
+            (
+                app_binary_path(&slot).to_string_lossy().into_owned(),
+                slot.to_string_lossy().into_owned(),
+            )
         } else {
             (String::new(), String::new())
         };
@@ -233,7 +237,7 @@ pub async fn list(app_handle: &AppHandle) -> Vec<HarnessCore> {
             source: CoreSource::App,
             version: installed_version.clone().unwrap_or_default(),
             tag: active_tag.clone().unwrap_or_default(),
-            path: active_dir.to_string_lossy().into_owned(),
+            path: app_binary_path(&active_dir).to_string_lossy().into_owned(),
             dir: active_dir.to_string_lossy().into_owned(),
             present: true,
             active: source == CoreSource::App,
@@ -575,7 +579,7 @@ fn row_for_tag(app_handle: &AppHandle, tag: &str, dir: &Path) -> HarnessCore {
         source: CoreSource::App,
         version: download::parse_version_from_tag(tag).unwrap_or_default(),
         tag: tag.to_string(),
-        path: dir_str.clone(),
+        path: app_binary_path(dir).to_string_lossy().into_owned(),
         dir: dir_str,
         present: true,
         active,

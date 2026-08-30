@@ -35,9 +35,9 @@ pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeIn
 
 /// 把当前核心的一次性认证 URL 交给尚未挂载的宿主 iframe。
 #[tauri::command]
-pub fn take_harness_launch_url(app_handle: AppHandle) -> Option<String> {
+pub fn take_harness_launch_url(app_handle: AppHandle, generation: u64) -> Option<String> {
     let port = config::get_store_dat_setting(&app_handle).port;
-    crate::service::workflow::utils::take_harness_launch_url(port)
+    crate::service::workflow::utils::take_harness_launch_url(port, generation)
 }
 
 /// 在系统浏览器中打开 Harness 界面

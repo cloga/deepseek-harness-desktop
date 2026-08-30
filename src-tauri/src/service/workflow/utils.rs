@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -9,7 +10,8 @@ const DSH_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const DSH_MAX_BACKUPS: usize = 3;
 static DSH_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static PENDING_HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static PENDING_HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<(u64, String)>>> = OnceLock::new();
+static HARNESS_LAUNCH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn dsh_log_lock() -> &'static Mutex<()> {
     DSH_LOG_LOCK.get_or_init(|| Mutex::new(()))
@@ -19,8 +21,23 @@ fn harness_launch_url_slot() -> &'static Mutex<Option<String>> {
     HARNESS_LAUNCH_URL.get_or_init(|| Mutex::new(None))
 }
 
-fn pending_harness_launch_url_slot() -> &'static Mutex<Option<String>> {
+fn pending_harness_launch_url_slot() -> &'static Mutex<Option<(u64, String)>> {
     PENDING_HARNESS_LAUNCH_URL.get_or_init(|| Mutex::new(None))
+}
+
+/// 把前端单调递增的启动代绑定到随后捕获的认证 URL，阻止旧启动流程取走新 URL。
+pub fn set_harness_launch_generation(generation: u64) {
+    let previous = HARNESS_LAUNCH_GENERATION.fetch_max(generation, Ordering::SeqCst);
+    if generation < previous {
+        return;
+    }
+    if let Some((pending_generation, _)) = pending_harness_launch_url_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_mut()
+    {
+        *pending_generation = generation;
+    }
 }
 
 /// 清除上一进程的认证 URL，防止核心重启后复用已经失效的 token。
@@ -45,14 +62,19 @@ pub fn harness_launch_url(port: u16) -> Option<String> {
 }
 
 /// 仅向首次挂载的 WebView 交付一次认证 URL。
-pub fn take_harness_launch_url(port: u16) -> Option<String> {
-    let value = pending_harness_launch_url_slot()
+pub fn take_harness_launch_url(port: u16, generation: u64) -> Option<String> {
+    let mut pending = pending_harness_launch_url_slot()
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take()?;
+        .unwrap_or_else(|error| error.into_inner());
+    let (pending_generation, value) = pending.as_ref()?;
+    if *pending_generation != generation {
+        return None;
+    }
     let parsed = reqwest::Url::parse(&value).ok()?;
-    (parsed.host_str() == Some("127.0.0.1") && parsed.port_or_known_default() == Some(port))
-        .then_some(value)
+    if parsed.host_str() != Some("127.0.0.1") || parsed.port_or_known_default() != Some(port) {
+        return None;
+    }
+    pending.take().map(|(_, value)| value)
 }
 
 /// 捕获 dsh 公布的一次性浏览器认证 URL，并返回适合写日志的脱敏文本。
@@ -66,12 +88,16 @@ fn capture_and_redact_launch_url(line: &str) -> String {
     let Ok(parsed) = reqwest::Url::parse(candidate) else {
         return line.to_string();
     };
-    let token = parsed
+    let token_pairs = parsed
         .query_pairs()
-        .find_map(|(name, value)| (name == "token").then(|| value.into_owned()));
-    let Some(token) = token.filter(|value| !value.is_empty()) else {
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if !token_pairs
+        .iter()
+        .any(|(name, value)| name == "token" && !value.is_empty())
+    {
         return line.to_string();
-    };
+    }
     if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
         return line.to_string();
     }
@@ -80,8 +106,24 @@ fn capture_and_redact_launch_url(line: &str) -> String {
         .unwrap_or_else(|error| error.into_inner()) = Some(candidate.to_string());
     *pending_harness_launch_url_slot()
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(candidate.to_string());
-    line.replace(&token, "<redacted>")
+        .unwrap_or_else(|error| error.into_inner()) = Some((
+        HARNESS_LAUNCH_GENERATION.load(Ordering::SeqCst),
+        candidate.to_string(),
+    ));
+    let mut safe_url = parsed;
+    safe_url.query_pairs_mut().clear().extend_pairs(
+        token_pairs.iter().map(|(name, value)| {
+            (
+                name.as_str(),
+                if name == "token" {
+                    "<redacted>"
+                } else {
+                    value.as_str()
+                },
+            )
+        }),
+    );
+    line.replacen(candidate, safe_url.as_str(), 1)
 }
 
 /// 构造仅用于回环地址探测的 HTTP 客户端。
@@ -378,6 +420,15 @@ mod tests {
     use super::*;
     use std::fs;
 
+    static LAUNCH_URL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn launch_url_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        LAUNCH_URL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     fn write(path: &PathBuf, content: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -560,29 +611,59 @@ mod tests {
 
     #[test]
     fn authenticated_launch_url_is_captured_redacted_and_taken_once() {
+        let _guard = launch_url_test_guard();
         clear_harness_launch_url();
+        let generation = HARNESS_LAUNCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let safe = capture_and_redact_launch_url(
             "dsh web: http://127.0.0.1:3083/?token=secret-value",
         );
         assert_eq!(
             safe,
-            "dsh web: http://127.0.0.1:3083/?token=<redacted>"
+            "dsh web: http://127.0.0.1:3083/?token=%3Credacted%3E"
         );
         assert_eq!(
             harness_launch_url(3083).as_deref(),
             Some("http://127.0.0.1:3083/?token=secret-value")
         );
         assert_eq!(
-            take_harness_launch_url(3083).as_deref(),
+            take_harness_launch_url(3083, generation).as_deref(),
             Some("http://127.0.0.1:3083/?token=secret-value")
         );
-        assert_eq!(take_harness_launch_url(3083), None);
+        assert_eq!(take_harness_launch_url(3083, generation), None);
         assert_eq!(harness_launch_url(3080), None);
         clear_harness_launch_url();
     }
 
     #[test]
+    fn wrong_port_or_generation_does_not_consume_launch_url() {
+        let _guard = launch_url_test_guard();
+        clear_harness_launch_url();
+        let generation = HARNESS_LAUNCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        capture_and_redact_launch_url("dsh web: http://127.0.0.1:3083/?token=secret");
+        assert_eq!(take_harness_launch_url(3084, generation), None);
+        assert_eq!(
+            take_harness_launch_url(3083, generation.saturating_sub(1)),
+            None
+        );
+        assert!(take_harness_launch_url(3083, generation).is_some());
+    }
+
+    #[test]
+    fn redacts_encoded_and_repeated_tokens() {
+        let _guard = launch_url_test_guard();
+        clear_harness_launch_url();
+        let safe = capture_and_redact_launch_url(
+            "dsh web: http://127.0.0.1:3083/?token=secret%2Fvalue&keep=a%2Fb&token=second",
+        );
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains("second"));
+        assert!(safe.contains("keep=a%2Fb"));
+        assert_eq!(safe.matches("token=%3Credacted%3E").count(), 2);
+    }
+
+    #[test]
     fn non_loopback_or_tokenless_urls_are_not_captured() {
+        let _guard = launch_url_test_guard();
         clear_harness_launch_url();
         for line in [
             "dsh web: http://example.com:3083/?token=secret",

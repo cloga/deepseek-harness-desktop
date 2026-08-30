@@ -314,7 +314,8 @@ pub async fn check_dsh_update(
 
 /// 启动 Harness 服务
 #[tauri::command]
-pub async fn launch_harness(app_handle: AppHandle) -> Result<(), String> {
+pub async fn launch_harness(app_handle: AppHandle, generation: u64) -> Result<(), String> {
+    workflow::utils::set_harness_launch_generation(generation);
     workflow::launch(app_handle).await
 }
 

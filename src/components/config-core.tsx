@@ -371,16 +371,18 @@ export function ConfigCore() {
                   </>
                 )}
                 footer={(
-                  <If cond={!!core.path}>
+                  <If cond={!!core.path || (core.source === 'app' && !!core.tag)}>
                     <div className="flex min-w-0 flex-col gap-0.5">
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        <Description className="shrink-0 text-xs">
-                          {t('core.entry_path')}
-                        </Description>
-                        <code className="min-w-0 truncate text-xs text-muted" title={core.path}>
-                          {core.path}
-                        </code>
-                      </div>
+                      <If cond={!!core.path}>
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <Description className="shrink-0 text-xs">
+                            {t('core.entry_path')}
+                          </Description>
+                          <code className="min-w-0 truncate text-xs text-muted" title={core.path}>
+                            {core.path}
+                          </code>
+                        </div>
+                      </If>
                       <If cond={core.source === 'app' && !!core.tag}>
                         <div className="flex min-w-0 items-center gap-1.5">
                           <Description className="shrink-0 text-xs">

@@ -501,7 +501,7 @@ export const harness = defineStore({
       }
 
       const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
-      const launchUrl = await invoke<string | null>('take_harness_launch_url')
+      const launchUrl = await invoke<string | null>('take_harness_launch_url', { generation: token })
       if (token !== bootToken)
         return false
 
@@ -538,6 +538,7 @@ export const harness = defineStore({
 
     /** 拉起服务并等待健康检查通过，通过后才允许挂载 iframe */
     async launchAndWait(token?: number) {
+      const launchGeneration = token ?? bootToken
       this.status = 'ready'
       this.installer = initialInstaller
       this.errorMsg = ''
@@ -552,7 +553,7 @@ export const harness = defineStore({
       this.startupPhase = 'process-boot'
       this.startupReason = i18next.t('status.loading_process')
       try {
-        await invoke('launch_harness')
+        await invoke('launch_harness', { generation: launchGeneration })
         this.serviceRunning = true
         this.startupPhase = 'process-boot'
         this.startupReason = i18next.t('status.loading_process')
