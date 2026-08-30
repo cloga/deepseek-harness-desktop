@@ -59,6 +59,10 @@ function generateTimestampedUrl(baseUrl: string): string {
   return `${baseUrl}${separator}t=${timestamp}`
 }
 
+interface HarnessRuntimeInfo {
+  service_url: string
+}
+
 /** 健康检查结果：healthy 表示服务就绪；notOwned 表示 dsh 进程已退出（启动即崩溃，快速失败信号） */
 interface HealthCheckResult {
   healthy: boolean
@@ -282,7 +286,7 @@ export const harness = defineStore({
         await invoke('launch_harness')
         this.serviceRunning = true
         // 后端遇到端口占用时会自动递增并持久化端口，启动后重新读取真实地址。
-        const runtimeInfo = await invoke<{ service_url: string }>('get_runtime_info')
+        const runtimeInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
         this.serviceUrl = runtimeInfo.service_url
         this.iframeSrc = generateTimestampedUrl(runtimeInfo.service_url)
 
@@ -305,9 +309,10 @@ export const harness = defineStore({
         // （auto_start）而提前返回，此刻端口若尚未落库，上面读到的 service_url 会是
         // 旧端口；健康检查通过意味着服务已在最终端口就绪，此时读取必然准确。
         // 避免 iframe 挂载到一个无人监听的地址（表现为首次加载失败、刷新后恢复）。
-        const readyInfo = await invoke<{ service_url: string }>('get_runtime_info')
+        const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
+        const launchUrl = await invoke<string | null>('take_harness_launch_url')
         this.serviceUrl = readyInfo.service_url
-        this.iframeSrc = generateTimestampedUrl(readyInfo.service_url)
+        this.iframeSrc = generateTimestampedUrl(launchUrl || readyInfo.service_url)
         this.serviceHealthy = true
         // 服务（重）启动成功：清空插件异常修复态（若曾进入），并重置已「暂不处理」的插件
         this.recovery = { required: false, info: null, attempts: 0, busy: false }
@@ -355,7 +360,7 @@ export const harness = defineStore({
         catch (err) {
           console.error('[Harness] failed to listen install-progress:', err)
         }
-        const runtimeInfo = await invoke<{ service_url: string }>('get_runtime_info')
+        const runtimeInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
         this.serviceUrl = runtimeInfo.service_url
         this.iframeSrc = generateTimestampedUrl(runtimeInfo.service_url)
 

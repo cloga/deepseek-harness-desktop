@@ -28,7 +28,7 @@ import { PanelState } from './panel-state'
  * - 下载版本：拉指定 tag 的发布资产到历史槽位（不激活），随后可切换；
  *   卸载仅允许非激活的已下载版本。
  * - 本地核心更新：通过用户包管理器 CLI（npm install -g @latest / pnpm add -g @latest）。
- * - 每行展示核心入口（cli path，超长省略号 + 限制宽度）。
+ * - 每行展示实际核心入口；预打包行同时展示完整 release tag，避免只凭版本误判来源。
  */
 export function ConfigCore() {
   const [dialogHolder, openDialog] = useOverlay(Modal, { type: 'holder' })
@@ -292,6 +292,30 @@ export function ConfigCore() {
                     </Button>
                   </If>
                 </>
+              )}
+              footer={(
+                <If cond={!!core.path}>
+                  <div className="flex min-w-0 flex-col gap-0.5">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <Description className="shrink-0 text-xs">
+                        {t('core.entry_path')}
+                      </Description>
+                      <code className="min-w-0 truncate text-xs text-muted" title={core.path}>
+                        {core.path}
+                      </code>
+                    </div>
+                    <If cond={core.source === 'app' && !!core.tag}>
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <Description className="shrink-0 text-xs">
+                          {t('core.release_tag')}
+                        </Description>
+                        <code className="min-w-0 truncate text-xs text-muted" title={core.tag}>
+                          {core.tag}
+                        </code>
+                      </div>
+                    </If>
+                  </div>
+                </If>
               )}
             />
           ))}

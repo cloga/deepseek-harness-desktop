@@ -382,6 +382,8 @@ pub fn get_dsh_version<R: Runtime>(app_handle: &AppHandle<R>) -> Option<String> 
 pub struct RuntimeInfo {
     pub app_version: String,
     pub dsh_version: Option<String>,
+    pub core_source: String,
+    pub core_path: Option<String>,
     pub node_version: String,
     pub service_url: String,
     pub data_dir: String,
@@ -394,6 +396,8 @@ pub fn runtime_info<R: Runtime>(app: &AppHandle<R>, port: u16) -> RuntimeInfo {
     RuntimeInfo {
         app_version: app.package_info().version.to_string(),
         dsh_version: get_dsh_version(app),
+        core_source: "app".to_string(),
+        core_path: None,
         node_version: get_active_node_version(),
         service_url: get_dsh_service_url(port),
         // 用户数据所在目录 = $DSH_HOME（release 为官方 ~/.dsh，debug 为独立

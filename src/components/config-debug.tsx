@@ -13,6 +13,8 @@ import { Info } from './info'
 export interface RuntimeInfo {
   app_version: string
   dsh_version: string | null
+  core_source: 'local' | 'app'
+  core_path: string | null
   node_version: string
   service_url: string
   data_dir: string
@@ -229,6 +231,15 @@ export function ConfigDebug() {
             </If>
 
           </Info>
+          <Info term={t('ui.core_source')}>
+            {info?.core_source ? t(`core.${info.core_source}`) : '-'}
+          </Info>
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <span className="shrink-0 min-w-[30%] text-muted font-medium">{t('ui.core_entry')}</span>
+            <span className="min-w-0 truncate font-mono text-[11px] text-muted/80" title={info?.core_path ?? '-'}>
+              {info?.core_path ?? '-'}
+            </span>
+          </div>
           <Info term={t('ui.node_version')}>{info?.node_version ? `v${info.node_version}` : '-'}</Info>
           <Info term={t('ui.platform')}>
             {info ? `${info.platform} / ${info.arch}` : '-'}

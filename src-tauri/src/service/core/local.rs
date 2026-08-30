@@ -70,10 +70,30 @@ pub(super) fn find_user_dsh_bin(app_handle: &AppHandle) -> Option<PathBuf> {
     #[cfg(windows)]
     let dirs = {
         let _ = &app_handle;
-        path_dirs
+        let mut dirs = path_dirs;
+        // GUI 进程会继承启动器创建时的 PATH 快照；即使用户 PATH 已写入 npm
+        // prefix，长驻启动器也可能尚未看到。Windows npm 的默认全局目录稳定在
+        // `%APPDATA%\npm`，显式补扫可避免“终端可用、桌面端未检测到”的假阴性。
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            push_unique_dir(&mut dirs, PathBuf::from(app_data).join("npm"));
+        }
+        if let Some(pnpm_home) = std::env::var_os("PNPM_HOME") {
+            push_unique_dir(&mut dirs, PathBuf::from(pnpm_home));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            push_unique_dir(&mut dirs, PathBuf::from(local_app_data).join("pnpm"));
+        }
+        dirs
     };
 
     scan_dirs_for_user_dsh(&dirs, candidates)
+}
+
+/// 追加不重复的候选目录，避免 PATH 与平台默认目录重合时重复扫描。
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !dirs.contains(&candidate) {
+        dirs.push(candidate);
+    }
 }
 
 /// 在给定目录列表中查找用户 dsh（跳过本应用生成的 shim）。
@@ -163,7 +183,10 @@ fn read_package_version(dir: &Path) -> Option<String> {
 
 /// 本地核心：包目录 + 版本 + bin.js 入口。任一环节缺失视为不存在。
 pub(super) fn local_core(app_handle: &AppHandle) -> Option<LocalCore> {
-    let package_dir = user_dsh_package_dir(app_handle)?;
+    let discovered_dir = user_dsh_package_dir(app_handle)?;
+    // npm link / pnpm link 在包目录放置 junction 或 symlink。启动与界面都使用真实
+    // 目标路径，避免把“全局 npm 入口”误当成实际代码来源；普通安装保持原路径。
+    let package_dir = dunce::canonicalize(&discovered_dir).unwrap_or(discovered_dir);
     let version = read_package_version(&package_dir)?;
     let bin = package_dir.join("lib").join("bin.js");
     if !bin.is_file() {
@@ -226,7 +249,17 @@ pub async fn update_local_core(app_handle: AppHandle) -> Result<String, String> 
     log::info!("Updating local dsh core via `{pm} {args:?}`");
 
     // GUI 进程下 npm/pnpm 均以控制台程序方式派生子进程，Windows 上需隐藏窗口
-    let program = if cfg!(windows) { format!("{pm}.cmd") } else { pm.to_string() };
+    let program = if cfg!(windows) && uses_pnpm {
+        find_user_dsh_bin(&app_handle)
+            .and_then(|bin| bin.parent().map(|dir| dir.join("pnpm.cmd")))
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "pnpm.cmd".to_string())
+    } else if cfg!(windows) {
+        format!("{pm}.cmd")
+    } else {
+        pm.to_string()
+    };
     let (status, stdout, stderr) = tauri::async_runtime::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&program);
         cmd.args(&args);
@@ -417,5 +450,13 @@ mod tests {
             Some(root.join("node_modules").join("@deepseek-ai").join("dsh"))
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn push_unique_dir_avoids_duplicate_platform_fallbacks() {
+        let npm = PathBuf::from(r"C:\Users\tester\AppData\Roaming\npm");
+        let mut dirs = vec![npm.clone()];
+        push_unique_dir(&mut dirs, npm.clone());
+        assert_eq!(dirs, vec![npm]);
     }
 }
