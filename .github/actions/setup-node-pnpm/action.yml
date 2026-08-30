@@ -24,3 +24,9 @@ runs:
         node-version: ${{ inputs.node-version }}
         cache: pnpm
         cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+    # prepare 等不安装依赖的 job 也会执行 setup-node 的 post cache，预先创建 store
+    # 避免手动测试构建因缓存路径不存在而失败。
+    - name: Ensure pnpm store exists
+      shell: bash
+      run: mkdir -p "$(pnpm store path --silent)"
