@@ -66,21 +66,22 @@ pub async fn proxy_health_check(port: u16) -> Result<String, String> {
 
     // 新核心在 Loader 完成后才打印一次性认证 URL；捕获到它比匿名探测插件
     // bundle 更强，且避免匿名请求因 401 被误判为“服务尚未启动”。
-    if let Some(url) = utils::harness_launch_url(port) {
-        return match client.get(url).send().await {
+    if utils::harness_launch_url(port).is_some() {
+        let root = format!("{}/", config::get_dsh_service_url(port));
+        return match client.get(root).send().await {
             Ok(response)
                 if response.status().is_success()
                     || response.status().is_redirection()
                     || response.status() == reqwest::StatusCode::UNAUTHORIZED =>
             {
-                Ok("healthy - authenticated launch URL ready".to_string())
+                Ok("healthy - authenticated launch URL captured and loopback ready".to_string())
             }
             Ok(response) => Err(format!(
-                "HARNESS_NOT_READY: authenticated launch URL returned {}",
+                "HARNESS_NOT_READY: authenticated loopback returned {}",
                 response.status()
             )),
             Err(error) => Err(format!(
-                "HARNESS_NOT_READY: authenticated launch URL probe failed: {error}"
+                "HARNESS_NOT_READY: authenticated loopback probe failed: {error}"
             )),
         };
     }
