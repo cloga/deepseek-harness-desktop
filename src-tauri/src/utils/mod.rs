@@ -48,6 +48,14 @@ pub fn patch_dsh(
         log::info!("dsh patch target not found, skip: {}", target.display());
         return Ok(());
     }
+    patch_file(&target, patch)
+}
+
+/// 对已解析的具体文件应用补丁，供源码工作区等非 node_modules 布局复用。
+pub fn patch_file(
+    target: &std::path::Path,
+    patch: impl FnOnce(&str) -> PatchOutcome,
+) -> Result<(), String> {
     let source = std::fs::read_to_string(&target)
         .map_err(|e| format!("DSH_PATCH_READ: {} failed: {e}", target.display()))?;
     match patch(&source) {
