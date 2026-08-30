@@ -84,12 +84,6 @@ function generateTimestampedUrl(baseUrl: string): string {
 
 interface HarnessRuntimeInfo {
   service_url: string
-  launch_url?: string | null
-}
-
-/** 认证核心优先使用一次性 launch URL；旧核心继续使用普通服务地址。 */
-function runtimeIframeUrl(info: HarnessRuntimeInfo): string {
-  return info.launch_url || info.service_url
 }
 
 /** 通过 Rust 代理探测服务健康状态（超时 8s，网络抖动时重试） */
@@ -507,11 +501,12 @@ export const harness = defineStore({
       }
 
       const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
+      const launchUrl = await invoke<string | null>('take_harness_launch_url')
       if (token !== bootToken)
         return false
 
       this.serviceUrl = readyInfo.service_url
-      this.iframeSrc = generateTimestampedUrl(runtimeIframeUrl(readyInfo))
+      this.iframeSrc = generateTimestampedUrl(launchUrl || readyInfo.service_url)
       this.serviceHealthy = true
       this.serviceRunning = true
       this.status = 'ready'

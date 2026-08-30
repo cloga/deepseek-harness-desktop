@@ -63,6 +63,28 @@ pub async fn proxy_health_check(port: u16) -> Result<String, String> {
     }
     let client = utils::loopback_http_client(config::HEALTH_CHECK_TIMEOUT)
         .map_err(|e| format!("HARNESS_HEALTH_CLIENT_FAILED: {e}"))?;
+
+    // 新核心在 Loader 完成后才打印一次性认证 URL；捕获到它比匿名探测插件
+    // bundle 更强，且避免匿名请求因 401 被误判为“服务尚未启动”。
+    if let Some(url) = utils::harness_launch_url(port) {
+        return match client.get(url).send().await {
+            Ok(response)
+                if response.status().is_success()
+                    || response.status().is_redirection()
+                    || response.status() == reqwest::StatusCode::UNAUTHORIZED =>
+            {
+                Ok("healthy - authenticated launch URL ready".to_string())
+            }
+            Ok(response) => Err(format!(
+                "HARNESS_NOT_READY: authenticated launch URL returned {}",
+                response.status()
+            )),
+            Err(error) => Err(format!(
+                "HARNESS_NOT_READY: authenticated launch URL probe failed: {error}"
+            )),
+        };
+    }
+
     let endpoints = client_probe_endpoints(port).await?;
     let total = endpoints.len();
     let mut ready = 0usize;

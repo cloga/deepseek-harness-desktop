@@ -557,4 +557,40 @@ mod tests {
         assert!(!log.exists());
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn authenticated_launch_url_is_captured_redacted_and_taken_once() {
+        clear_harness_launch_url();
+        let safe = capture_and_redact_launch_url(
+            "dsh web: http://127.0.0.1:3083/?token=secret-value",
+        );
+        assert_eq!(
+            safe,
+            "dsh web: http://127.0.0.1:3083/?token=<redacted>"
+        );
+        assert_eq!(
+            harness_launch_url(3083).as_deref(),
+            Some("http://127.0.0.1:3083/?token=secret-value")
+        );
+        assert_eq!(
+            take_harness_launch_url(3083).as_deref(),
+            Some("http://127.0.0.1:3083/?token=secret-value")
+        );
+        assert_eq!(take_harness_launch_url(3083), None);
+        assert_eq!(harness_launch_url(3080), None);
+        clear_harness_launch_url();
+    }
+
+    #[test]
+    fn non_loopback_or_tokenless_urls_are_not_captured() {
+        clear_harness_launch_url();
+        for line in [
+            "dsh web: http://example.com:3083/?token=secret",
+            "dsh web: https://127.0.0.1:443/?token=secret",
+            "dsh web: http://127.0.0.1:3083/",
+        ] {
+            assert_eq!(capture_and_redact_launch_url(line), line);
+        }
+        assert_eq!(harness_launch_url(443), None);
+    }
 }

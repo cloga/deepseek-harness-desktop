@@ -22,7 +22,6 @@ export interface RuntimeInfo {
   core_path: string | null
   node_version: string
   service_url: string
-  launch_url?: string | null
   data_dir: string
   log_path: string
   platform: string

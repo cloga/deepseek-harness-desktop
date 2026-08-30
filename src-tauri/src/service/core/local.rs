@@ -261,7 +261,13 @@ pub async fn update_local_core(app_handle: AppHandle) -> Result<String, String> 
     log::info!("Updating local dsh core via `{pm} {args:?}`");
 
     // GUI 进程下 npm/pnpm 均以控制台程序方式派生子进程，Windows 上需隐藏窗口
-    let program = if cfg!(windows) {
+    let program = if cfg!(windows) && uses_pnpm {
+        find_user_dsh_bin(&app_handle)
+            .and_then(|bin| bin.parent().map(|dir| dir.join("pnpm.cmd")))
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "pnpm.cmd".to_string())
+    } else if cfg!(windows) {
         format!("{pm}.cmd")
     } else {
         pm.to_string()
