@@ -526,7 +526,7 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::bridge::update_local_core,
         crate::bridge::proxy_health_check,
         crate::bridge::get_runtime_info,
-        crate::bridge::take_harness_launch_url,
+        crate::bridge::prepare_harness_webview,
         crate::bridge::runtime_ready,
         crate::bridge::get_app_config,
         crate::bridge::update_app_config,

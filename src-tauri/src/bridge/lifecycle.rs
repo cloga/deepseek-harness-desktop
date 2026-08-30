@@ -346,19 +346,18 @@ pub async fn check_dsh_update(
 /// 启动 Harness 服务
 #[tauri::command]
 pub async fn launch_harness(app_handle: AppHandle) -> Result<u64, String> {
-    let generation = workflow::utils::begin_harness_launch_generation();
-    finish_harness_launch(workflow::launch(app_handle).await).map(|()| generation)
+    finish_harness_launch(workflow::launch(app_handle).await)
 }
 
 /// 启动失败时清除已重标的旧 URL，避免前置检查错误留下可取用的过期凭据。
-fn finish_harness_launch(result: Result<(), String>) -> Result<(), String> {
+fn finish_harness_launch(result: Result<u64, String>) -> Result<u64, String> {
     finish_harness_launch_with(result, workflow::utils::clear_harness_launch_url)
 }
 
 fn finish_harness_launch_with(
-    result: Result<(), String>,
+    result: Result<u64, String>,
     clear_launch_url: impl FnOnce(),
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if result.is_err() {
         clear_launch_url();
     }

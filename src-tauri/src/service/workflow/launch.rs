@@ -26,7 +26,8 @@ use super::sweep::persist_harness_pid;
 #[cfg(windows)]
 use super::sweep::{dsh_bin_open_error, relaunch_marker_path, relaunch_via_shell_escape};
 use super::utils::{
-    clear_harness_launch_url, is_port_in_use, rotate_service_log, spawn_output_readers,
+    begin_harness_launch_generation, bind_harness_launch_process,
+    current_harness_launch_generation, is_port_in_use, rotate_service_log, spawn_output_readers,
 };
 use super::win_inspector;
 
@@ -152,10 +153,12 @@ pub async fn start(app_handle: tauri::AppHandle) -> Result<(), String> {
     let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle);
 
     if !setting.installed {
+        super::utils::clear_harness_launch_url();
         log::debug!("Harness not installed, skipping startup");
         return Ok(());
     }
     if !node_binary_path.exists() || !dsh_binary_path.exists() {
+        super::utils::clear_harness_launch_url();
         // Windows RedirectionGuard(448)：安装器继承的强制执行上下文永不自行恢复，
         // 先尝试通过 explorer 逃逸重拉（见 relaunch_via_shell_escape 注释），
         // 成功则本进程退出；未命中（重拉未逃逸/非 448）才走常规缺失处理。
@@ -207,7 +210,7 @@ pub async fn restart(app_handle: tauri::AppHandle) -> Result<(), String> {
 }
 
 /// 启动 Harness 服务进程
-pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
+pub async fn launch(app_handle: tauri::AppHandle) -> Result<u64, String> {
     let mut setting = config::get_store_dat_setting(&app_handle);
     let node_binary_path = config::get_node_binary_path(&app_handle);
     // 活动核心的 dsh 入口（本地核心优先，未检测到走预打包）
@@ -215,11 +218,13 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
 
     log::debug!("Checking Node.js path: {:?}", node_binary_path);
     if !node_binary_path.exists() {
+        super::utils::clear_harness_launch_url();
         log::error!("Node.js not installed");
         return Err("NODE_NOT_FOUND: Node.js not installed".to_string());
     }
     log::debug!("Checking Harness path: {:?}", dsh_binary_path);
     if !dsh_binary_path.exists() {
+        super::utils::clear_harness_launch_url();
         log::error!("Harness not installed");
         return Err("HARNESS_NOT_FOUND: Harness not installed".to_string());
     }
@@ -231,7 +236,9 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     // 避免重复启动（配合启动守卫，确保并发调用只拉起一个进程）
     if has_owned_process() {
         log::info!("Owned Harness process is already running, skipping launch");
-        return Ok(());
+        return current_harness_launch_generation().ok_or_else(|| {
+            "HARNESS_LAUNCH_OWNER_MISSING: owned process has no launch owner".into()
+        });
     }
     if LAUNCH_GUARD
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -311,12 +318,6 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     // minimal-win 用户 preset 落盘（幂等）。最佳努力：失败只告警，不阻断启动。
     if let Err(e) = win_inspector::apply(&app_handle) {
         log::warn!("win32 terminal support apply failed: {e}");
-    }
-    // alpha 的 iframe 无法稳定完成 SameSite=Strict browser-session Cookie 交换：
-    // 仅命中 alpha 鉴权锚点时跳过 browser-session 层，但保留 Host/Origin fence；
-    // 旧核心无 alpha 锚点，patch_dsh 会安全跳过，不改变旧版行为。
-    if let Err(e) = crate::service::patch::alpha_auth::apply(&app_handle) {
-        log::warn!("alpha embedded auth patch failed: {e}");
     }
     // renderer 的 SlotOutlet 一行导出补丁（dsh-tauri-ui 设置侧边栏依赖）：只补
     // 活动核心的 dsh-client-ui-renderer lib/client.js，已含导出即跳过（幂等；核心
@@ -454,7 +455,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")))
         .map_err(|e| format!("LOG_DIR_MKDIR_FAILED: create log dir failed: {e}"))?;
     rotate_service_log(&log_path, 3);
-    clear_harness_launch_url();
+    let generation = begin_harness_launch_generation();
 
     // rc.8 起 `dsh web` 默认在系统浏览器打开 UI；桌面端内嵌 WebView，不需要
     // 浏览器，追加 `--no-open` 关闭（老版本无此标志时按版本判定不传）。
@@ -495,6 +496,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
                 // PID 与句柄作为整体一次登记，与退出清理（take 一并取出）配对
                 let handle_value = handle as usize;
                 set_owned_process_with_handle(pid, handle_value);
+                let owner_bound = bind_harness_launch_process(generation, pid);
                 let exit_app_handle = app_handle.clone();
                 std::thread::spawn(move || unsafe {
                     use windows_sys::Win32::Foundation::CloseHandle;
@@ -520,7 +522,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
                         CloseHandle(h);
                     }
                 });
-                (Some(stdout), Some(stderr), pid)
+                (Some(stdout), Some(stderr), pid, owner_bound)
             })
         }
         #[cfg(not(windows))]
@@ -551,6 +553,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
                 let stdout = child.stdout.take();
                 let stderr = child.stderr.take();
                 set_owned_process(pid);
+                let owner_bound = bind_harness_launch_process(generation, pid);
                 let exit_app_handle = app_handle.clone();
                 std::thread::spawn(move || {
                     let code = child.wait().ok().and_then(|status| status.code());
@@ -559,23 +562,30 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
                     // 仅当该 PID 仍是当前登记才取出——旧监视线程不会误清新进程。
                     let _ = on_owned_process_exit(&exit_app_handle, pid, |_| code.map(i64::from));
                 });
-                (stdout, stderr, pid)
+                (stdout, stderr, pid, owner_bound)
             })
         }
     };
 
     match spawn_result {
-        Ok((stdout, stderr, pid)) => {
+        Ok((stdout, stderr, pid, owner_bound)) => {
+            if !owner_bound {
+                super::process::stop(app_handle.clone()).await?;
+                return Err(
+                    "HARNESS_LAUNCH_OWNER_CHANGED: launch owner changed before bind".into(),
+                );
+            }
             log::info!(
                 "Harness process started successfully: pid={pid}, port={}",
                 setting.port
             );
             // 记录 PID+端口供下次启动清扫崩溃残留的孤儿实例（见 sweep_orphan_harness）
             persist_harness_pid(&app_handle, pid, setting.port);
-            spawn_output_readers(stdout, stderr, log_path);
-            Ok(())
+            spawn_output_readers(stdout, stderr, log_path, generation, pid);
+            Ok(generation)
         }
         Err(e) => {
+            super::utils::clear_harness_launch_url();
             log::error!("Failed to start process: {}", e);
             Err(format!("PROCESS_START_FAILED: {e}"))
         }

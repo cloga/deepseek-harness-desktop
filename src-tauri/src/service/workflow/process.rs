@@ -164,6 +164,7 @@ pub(super) fn on_owned_process_exit(
     exit_code: impl FnOnce(&OwnedProcess) -> Option<i64>,
 ) -> Option<OwnedProcess> {
     let owned = take_owned_process_if(pid)?;
+    super::utils::clear_harness_launch_url_if_pid(pid);
     // 必须在成功取走当前 PID 后才读取 Windows 句柄：正常停止会先取走并关闭
     // 句柄，旧监视线程不得再查询该句柄，更不得发送“意外退出”事件。
     let exit_code = exit_code(&owned);
@@ -196,8 +197,10 @@ pub(super) fn on_owned_process_exit(
 fn terminate_owned_process() {
     // 一次性取出 PID+句柄（成对），杜绝「PID 已清空/句柄未清」的漏杀窗口
     let Some(owned) = take_owned_process() else {
+        super::utils::clear_harness_launch_url();
         return;
     };
+    super::utils::clear_harness_launch_url_if_pid(owned.pid);
 
     #[cfg(windows)]
     {
@@ -443,6 +446,7 @@ pub async fn stop(app_handle: tauri::AppHandle) -> Result<(), String> {
     // 进程终止涉及 WaitForSingleObject（至多 5s）与 taskkill/kill 等同步阻塞
     // 调用，移出 Tokio 执行线程避免卡住其他并发任务（WARN-7/P2-#20）。
     LAUNCH_GUARD.store(false, Ordering::SeqCst);
+    super::utils::clear_harness_launch_url();
     tauri::async_runtime::spawn_blocking(terminate_owned_process)
         .await
         .map_err(|e| format!("STOP_FAILED: {e}"))?;
@@ -461,6 +465,7 @@ pub async fn stop(app_handle: tauri::AppHandle) -> Result<(), String> {
 ///
 /// 退出路径上不更新状态、不做异步等待，只结束当前应用持有的 Harness 进程树。
 pub fn stop_on_exit(app_handle: tauri::AppHandle, _port: u16) {
+    super::utils::clear_harness_launch_url();
     terminate_owned_process();
     // 正常退出路径同样清理清扫标记（崩溃路径才需要下次启动清扫）
     let _ = fs::remove_file(harness_pid_path(&app_handle));

@@ -7,7 +7,7 @@
 use crate::config;
 use crate::logger;
 use crate::service::core;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -33,19 +33,106 @@ pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeIn
     Ok(info)
 }
 
-/// 把当前核心的一次性认证 URL 交给尚未挂载的宿主 iframe。
+/// 用一次性 token 换取 HttpOnly Cookie 并注入宿主 WebView，token 不跨 IPC。
 #[tauri::command]
-pub fn take_harness_launch_url(app_handle: AppHandle, generation: u64) -> Option<String> {
+pub async fn prepare_harness_webview(
+    app_handle: AppHandle,
+    generation: u64,
+) -> Result<String, String> {
     let port = config::get_store_dat_setting(&app_handle).port;
-    crate::service::workflow::utils::take_harness_launch_url(port, generation)
+    let service_url = config::get_dsh_service_url(port);
+    let Some(launch_url) =
+        crate::service::workflow::utils::take_harness_launch_url(port, generation)
+    else {
+        return Ok(service_url);
+    };
+    let (cookie, iframe_url) = exchange_harness_cookie(&launch_url).await?;
+    let cookie_name = cookie.name().to_string();
+    let window = app_handle
+        .get_webview_window("main")
+        .ok_or_else(|| "HARNESS_AUTH_WEBVIEW_MISSING: main WebView not found".to_string())?;
+    window
+        .set_cookie(cookie)
+        .map_err(|error| format!("HARNESS_AUTH_COOKIE_SET_FAILED: {error}"))?;
+    let cookie_url = tauri::Url::parse(&iframe_url)
+        .map_err(|error| format!("HARNESS_AUTH_URL_INVALID: {error}"))?;
+    let cookies = tauri::async_runtime::spawn_blocking(move || window.cookies_for_url(cookie_url))
+        .await
+        .map_err(|error| format!("HARNESS_AUTH_COOKIE_VERIFY_JOIN_FAILED: {error}"))?
+        .map_err(|error| format!("HARNESS_AUTH_COOKIE_VERIFY_FAILED: {error}"))?;
+    if !cookies
+        .iter()
+        .any(|cookie| cookie.name() == cookie_name.as_str())
+    {
+        return Err("HARNESS_AUTH_COOKIE_NOT_STORED: WebView rejected session cookie".into());
+    }
+    Ok(iframe_url)
+}
+
+/// 向核心提交一次性 token，仅接受 303 + HttpOnly Cookie 的完整交换结果。
+async fn exchange_harness_cookie(
+    launch_url: &str,
+) -> Result<(tauri::webview::Cookie<'static>, String), String> {
+    let mut exchange_url = reqwest::Url::parse(launch_url)
+        .map_err(|error| format!("HARNESS_AUTH_URL_INVALID: {error}"))?;
+    if exchange_url.scheme() != "http" || exchange_url.host_str() != Some("127.0.0.1") {
+        return Err("HARNESS_AUTH_URL_REJECTED: expected 127.0.0.1 loopback URL".into());
+    }
+    exchange_url
+        .set_host(Some("localhost"))
+        .map_err(|error| format!("HARNESS_AUTH_HOST_INVALID: {error}"))?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(config::HEALTH_CHECK_TIMEOUT)
+        .build()
+        .map_err(|error| format!("HARNESS_AUTH_CLIENT_FAILED: {error}"))?;
+    let response = client
+        .get(exchange_url.clone())
+        .send()
+        .await
+        .map_err(|error| format!("HARNESS_AUTH_EXCHANGE_FAILED: {error}"))?;
+    if response.status() != reqwest::StatusCode::SEE_OTHER {
+        return Err(format!(
+            "HARNESS_AUTH_EXCHANGE_REJECTED: expected 303, got {}",
+            response.status()
+        ));
+    }
+    if response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        != Some("/")
+    {
+        return Err("HARNESS_AUTH_REDIRECT_INVALID: expected clean root redirect".into());
+    }
+    let set_cookie = response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "HARNESS_AUTH_COOKIE_MISSING: token exchange omitted cookie".to_string())?;
+    let mut cookie = tauri::webview::Cookie::parse(set_cookie.to_string())
+        .map_err(|error| format!("HARNESS_AUTH_COOKIE_INVALID: {error}"))?
+        .into_owned();
+    if cookie.http_only() != Some(true) {
+        return Err("HARNESS_AUTH_COOKIE_INSECURE: expected HttpOnly cookie".into());
+    }
+    // Web UI lives in an iframe below the Tauri shell, so its genuine signed cookie must
+    // explicitly allow that third-party context. localhost remains loopback-only, and the
+    // core's Host/Origin fence still rejects cross-site API traffic.
+    cookie.set_domain("localhost");
+    cookie.set_path("/");
+    cookie.set_same_site(tauri::webview::cookie::SameSite::None);
+    cookie.set_secure(true);
+    exchange_url.set_query(None);
+    Ok((cookie, exchange_url.to_string()))
 }
 
 /// 在系统浏览器中打开 Harness 界面
 #[tauri::command]
 pub async fn open_in_browser(app_handle: AppHandle) -> Result<(), String> {
     let port = config::get_store_dat_setting(&app_handle).port;
-    let url = crate::service::workflow::utils::harness_launch_url(port)
-        .unwrap_or_else(|| config::get_dsh_service_url(port));
+    let url = config::get_dsh_service_url(port);
     app_handle
         .opener()
         .open_url(url, None::<&str>)
@@ -263,8 +350,11 @@ pub async fn open_external_url(app_handle: AppHandle, url: String) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    use super::exchange_harness_cookie;
     use super::is_frontend_log_line;
     use super::tail_bytes;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn frontend_line_detected() {
@@ -303,6 +393,58 @@ mod tests {
         assert!(is_frontend_log_line(
             "2024-06-01 12:00:00.123Z  INFO frontend: padded"
         ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_cookie_exchange_keeps_anonymous_api_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept fixture request");
+                let mut request = [0_u8; 2048];
+                let size = stream.read(&mut request).expect("read fixture request");
+                let request = String::from_utf8_lossy(&request[..size]);
+                let response = if request.starts_with("GET /api/settings") {
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized"
+                } else {
+                    assert!(request.starts_with("GET /?token=one-shot "));
+                    "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: dsh-auth-test=signed; Max-Age=3600; Path=/; HttpOnly; SameSite=Strict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write fixture response");
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("fixture client");
+        let anonymous = client
+            .get(format!("http://{address}/api/settings"))
+            .send()
+            .await
+            .expect("anonymous request");
+        assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let (cookie, iframe_url) = exchange_harness_cookie(&format!(
+            "http://127.0.0.1:{}/?token=one-shot",
+            address.port()
+        ))
+        .await
+        .expect("token exchange");
+        assert_eq!(cookie.name(), "dsh-auth-test");
+        assert_eq!(cookie.http_only(), Some(true));
+        assert_eq!(cookie.domain(), Some("localhost"));
+        assert_eq!(cookie.path(), Some("/"));
+        assert_eq!(
+            cookie.same_site(),
+            Some(tauri::webview::cookie::SameSite::None)
+        );
+        assert_eq!(cookie.secure(), Some(true));
+        assert_eq!(iframe_url, format!("http://localhost:{}/", address.port()));
+        server.join().expect("fixture server");
     }
 
     #[test]

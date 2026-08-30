@@ -1,7 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -9,66 +8,123 @@ use std::time::Duration;
 const DSH_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const DSH_MAX_BACKUPS: usize = 3;
 static DSH_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static PENDING_HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static HARNESS_LAUNCH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default)]
+struct HarnessLaunchState {
+    next_generation: u64,
+    owner: Option<HarnessLaunchOwner>,
+}
+
+struct HarnessLaunchOwner {
+    generation: u64,
+    pid: Option<u32>,
+    url: Option<String>,
+    authenticated_port: Option<u16>,
+    pending: bool,
+}
 
 fn dsh_log_lock() -> &'static Mutex<()> {
     DSH_LOG_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn harness_launch_url_slot() -> &'static Mutex<Option<String>> {
-    HARNESS_LAUNCH_URL.get_or_init(|| Mutex::new(None))
-}
-
-fn pending_harness_launch_url_slot() -> &'static Mutex<Option<String>> {
-    PENDING_HARNESS_LAUNCH_URL.get_or_init(|| Mutex::new(None))
+fn harness_launch_state() -> &'static Mutex<HarnessLaunchState> {
+    static HARNESS_LAUNCH_STATE: OnceLock<Mutex<HarnessLaunchState>> = OnceLock::new();
+    HARNESS_LAUNCH_STATE.get_or_init(|| Mutex::new(HarnessLaunchState::default()))
 }
 
 /// 为一次宿主启动分配进程内单调递增的代号，阻止旧启动流程取走新 URL。
 pub fn begin_harness_launch_generation() -> u64 {
-    HARNESS_LAUNCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+    let mut state = harness_launch_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state.next_generation = state.next_generation.wrapping_add(1).max(1);
+    let generation = state.next_generation;
+    state.owner = Some(HarnessLaunchOwner {
+        generation,
+        pid: None,
+        url: None,
+        authenticated_port: None,
+        pending: false,
+    });
+    generation
+}
+
+/// 将启动代与真实子进程 PID 原子绑定，旧 reader 随后不能写入新进程状态。
+pub fn bind_harness_launch_process(generation: u64, pid: u32) -> bool {
+    let mut state = harness_launch_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(owner) = state.owner.as_mut() else {
+        return false;
+    };
+    if owner.generation != generation {
+        return false;
+    }
+    owner.pid = Some(pid);
+    true
+}
+
+/// 返回当前进程启动代；重复 launch 命中已持有进程时复用。
+pub fn current_harness_launch_generation() -> Option<u64> {
+    harness_launch_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .owner
+        .as_ref()
+        .map(|owner| owner.generation)
 }
 
 /// 清除上一进程的认证 URL，防止核心重启后复用已经失效的 token。
 pub fn clear_harness_launch_url() {
-    *harness_launch_url_slot()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = None;
-    *pending_harness_launch_url_slot()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = None;
-}
-
-/// 返回当前进程为指定端口公布的认证 URL。
-pub fn harness_launch_url(port: u16) -> Option<String> {
-    let value = harness_launch_url_slot()
+    harness_launch_state()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .clone()?;
-    let parsed = reqwest::Url::parse(&value).ok()?;
-    (parsed.host_str() == Some("127.0.0.1") && parsed.port_or_known_default() == Some(port))
-        .then_some(value)
+        .owner = None;
+}
+
+/// 仅当退出 PID 仍属于当前 URL owner 时清理，旧进程退出不能抹掉替代进程状态。
+pub fn clear_harness_launch_url_if_pid(pid: u32) -> bool {
+    let mut state = harness_launch_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if state.owner.as_ref().and_then(|owner| owner.pid) != Some(pid) {
+        return false;
+    }
+    state.owner = None;
+    true
+}
+
+/// 当前进程是否已为指定端口公布认证启动 URL。
+pub fn has_authenticated_harness_launch(port: u16) -> bool {
+    let state = harness_launch_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner.authenticated_port == Some(port))
 }
 
 /// 仅向首次挂载的 WebView 交付一次认证 URL。
 pub fn take_harness_launch_url(port: u16, generation: u64) -> Option<String> {
-    if HARNESS_LAUNCH_GENERATION.load(Ordering::SeqCst) != generation {
-        return None;
-    }
-    let mut pending = pending_harness_launch_url_slot()
+    let mut state = harness_launch_state()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let value = pending.as_ref()?;
+    let owner = state.owner.as_mut()?;
+    if owner.generation != generation || owner.pid.is_none() || !owner.pending {
+        return None;
+    }
+    let value = owner.url.as_ref()?;
     let parsed = reqwest::Url::parse(&value).ok()?;
     if parsed.host_str() != Some("127.0.0.1") || parsed.port_or_known_default() != Some(port) {
         return None;
     }
-    pending.take()
+    owner.pending = false;
+    owner.url.take()
 }
 
 /// 捕获 dsh 公布的一次性浏览器认证 URL，并返回适合写日志的脱敏文本。
-fn capture_and_redact_launch_url(line: &str) -> String {
+fn capture_and_redact_launch_url(line: &str, generation: u64, pid: u32) -> String {
     let Some(candidate) = line
         .strip_prefix("dsh web: ")
         .and_then(|rest| rest.split_whitespace().next())
@@ -91,12 +147,17 @@ fn capture_and_redact_launch_url(line: &str) -> String {
     if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
         return line.to_string();
     }
-    *harness_launch_url_slot()
+    let mut state = harness_launch_state()
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(candidate.to_string());
-    *pending_harness_launch_url_slot()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(candidate.to_string());
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(owner) = state.owner.as_mut() {
+        if owner.generation == generation && owner.pid == Some(pid) {
+            owner.url = Some(candidate.to_string());
+            owner.authenticated_port = parsed.port_or_known_default();
+            owner.pending = true;
+        }
+    }
+    drop(state);
     let mut safe_url = parsed;
     safe_url
         .query_pairs_mut()
@@ -265,8 +326,13 @@ pub fn is_port_in_use(port: u16) -> bool {
 /// - `stdout`: 子进程的标准输出
 /// - `stderr`: 子进程的标准错误输出
 /// - `log_path`: 前端日志面板读取的日志文件
-pub fn spawn_output_readers<R1, R2>(stdout: Option<R1>, stderr: Option<R2>, log_path: PathBuf)
-where
+pub fn spawn_output_readers<R1, R2>(
+    stdout: Option<R1>,
+    stderr: Option<R2>,
+    log_path: PathBuf,
+    generation: u64,
+    pid: u32,
+) where
     R1: Read + Send + 'static,
     R2: Read + Send + 'static,
 {
@@ -274,14 +340,26 @@ where
     if let Some(stdout) = stdout {
         let log_path = log_path.clone();
         thread::spawn(move || {
-            drain_subprocess_output(BufReader::new(stdout), log_path, log::Level::Info);
+            drain_subprocess_output(
+                BufReader::new(stdout),
+                log_path,
+                log::Level::Info,
+                generation,
+                pid,
+            );
         });
     }
 
     // 在独立线程中读取 stderr
     if let Some(stderr) = stderr {
         thread::spawn(move || {
-            drain_subprocess_output(BufReader::new(stderr), log_path, log::Level::Warn);
+            drain_subprocess_output(
+                BufReader::new(stderr),
+                log_path,
+                log::Level::Warn,
+                generation,
+                pid,
+            );
         });
     }
 }
@@ -298,6 +376,8 @@ fn drain_subprocess_output<R: Read + Send + 'static>(
     mut reader: BufReader<R>,
     log_path: PathBuf,
     level: log::Level,
+    generation: u64,
+    pid: u32,
 ) {
     loop {
         let mut bytes = Vec::new();
@@ -308,7 +388,7 @@ fn drain_subprocess_output<R: Read + Send + 'static>(
                 let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
                 let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
                 let line = String::from_utf8_lossy(bytes);
-                let safe_line = capture_and_redact_launch_url(&line);
+                let safe_line = capture_and_redact_launch_url(&line, generation, pid);
                 match level {
                     log::Level::Warn => log::warn!(target: "dsh", "{}", safe_line),
                     _ => log::info!(target: "dsh", "{}", safe_line),
@@ -444,6 +524,8 @@ mod tests {
             std::io::BufReader::new(std::io::Cursor::new(data)),
             log.clone(),
             log::Level::Warn,
+            0,
+            0,
         );
 
         let content = fs::read_to_string(&log).unwrap();
@@ -480,6 +562,8 @@ mod tests {
             std::io::BufReader::new(std::io::Cursor::new(b"a\r\nb\n".to_vec())),
             log.clone(),
             log::Level::Info,
+            0,
+            0,
         );
 
         let content = fs::read_to_string(&log).unwrap();
@@ -602,19 +686,20 @@ mod tests {
         let _guard = launch_url_test_guard();
         clear_harness_launch_url();
         let generation = begin_harness_launch_generation();
-        let safe =
-            capture_and_redact_launch_url("dsh web: http://127.0.0.1:3083/?token=secret-value");
-        assert_eq!(safe, "dsh web: http://127.0.0.1:3083/?token=%3Credacted%3E");
-        assert_eq!(
-            harness_launch_url(3083).as_deref(),
-            Some("http://127.0.0.1:3083/?token=secret-value")
+        assert!(bind_harness_launch_process(generation, 42));
+        let safe = capture_and_redact_launch_url(
+            "dsh web: http://127.0.0.1:3083/?token=secret-value",
+            generation,
+            42,
         );
+        assert_eq!(safe, "dsh web: http://127.0.0.1:3083/?token=%3Credacted%3E");
+        assert!(has_authenticated_harness_launch(3083));
         assert_eq!(
             take_harness_launch_url(3083, generation).as_deref(),
             Some("http://127.0.0.1:3083/?token=secret-value")
         );
         assert_eq!(take_harness_launch_url(3083, generation), None);
-        assert_eq!(harness_launch_url(3080), None);
+        assert!(!has_authenticated_harness_launch(3080));
         clear_harness_launch_url();
     }
 
@@ -623,7 +708,12 @@ mod tests {
         let _guard = launch_url_test_guard();
         clear_harness_launch_url();
         let generation = begin_harness_launch_generation();
-        capture_and_redact_launch_url("dsh web: http://127.0.0.1:3083/?token=secret");
+        assert!(bind_harness_launch_process(generation, 43));
+        capture_and_redact_launch_url(
+            "dsh web: http://127.0.0.1:3083/?token=secret",
+            generation,
+            43,
+        );
         assert_eq!(take_harness_launch_url(3084, generation), None);
         assert_eq!(
             take_harness_launch_url(3083, generation.saturating_sub(1)),
@@ -645,6 +735,8 @@ mod tests {
         clear_harness_launch_url();
         let safe = capture_and_redact_launch_url(
             "dsh web: http://127.0.0.1:3083/?token=secret%2Fvalue&keep=a%2Fb&token=second",
+            0,
+            0,
         );
         assert!(!safe.contains("secret"));
         assert!(!safe.contains("second"));
@@ -661,8 +753,36 @@ mod tests {
             "dsh web: https://127.0.0.1:443/?token=secret",
             "dsh web: http://127.0.0.1:3083/",
         ] {
-            assert_eq!(capture_and_redact_launch_url(line), line);
+            assert_eq!(capture_and_redact_launch_url(line, 0, 0), line);
         }
-        assert_eq!(harness_launch_url(443), None);
+        assert!(!has_authenticated_harness_launch(443));
+    }
+
+    #[test]
+    fn old_reader_cannot_refill_replacement_owner() {
+        let _guard = launch_url_test_guard();
+        clear_harness_launch_url();
+        let old_generation = begin_harness_launch_generation();
+        assert!(bind_harness_launch_process(old_generation, 51));
+        let new_generation = begin_harness_launch_generation();
+        assert!(bind_harness_launch_process(new_generation, 52));
+        capture_and_redact_launch_url(
+            "dsh web: http://127.0.0.1:3083/?token=old",
+            old_generation,
+            51,
+        );
+        assert!(!has_authenticated_harness_launch(3083));
+    }
+
+    #[test]
+    fn exit_cleanup_only_matches_current_pid() {
+        let _guard = launch_url_test_guard();
+        clear_harness_launch_url();
+        let generation = begin_harness_launch_generation();
+        assert!(bind_harness_launch_process(generation, 62));
+        assert!(!clear_harness_launch_url_if_pid(61));
+        assert_eq!(current_harness_launch_generation(), Some(generation));
+        assert!(clear_harness_launch_url_if_pid(62));
+        assert_eq!(current_harness_launch_generation(), None);
     }
 }

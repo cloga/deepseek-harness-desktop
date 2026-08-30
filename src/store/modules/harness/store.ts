@@ -501,12 +501,12 @@ export const harness = defineStore({
       }
 
       const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
-      const launchUrl = await invoke<string | null>('take_harness_launch_url', { generation: launchGeneration })
+      const iframeUrl = await invoke<string>('prepare_harness_webview', { generation: launchGeneration })
       if (token !== bootToken)
         return false
 
       this.serviceUrl = readyInfo.service_url
-      this.iframeSrc = generateTimestampedUrl(launchUrl || readyInfo.service_url)
+      this.iframeSrc = generateTimestampedUrl(iframeUrl)
       this.serviceHealthy = true
       this.serviceRunning = true
       this.status = 'ready'

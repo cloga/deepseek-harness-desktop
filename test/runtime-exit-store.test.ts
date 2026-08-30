@@ -102,8 +102,8 @@ describe('runtime exit store', () => {
           return { service_url: 'http://127.0.0.1:31415' }
         return finalRuntimeInfo
       }
-      if (command === 'take_harness_launch_url')
-        return null
+      if (command === 'prepare_harness_webview')
+        return 'http://127.0.0.1:31415'
       if (command === 'proxy_health_check') {
         healthChecks++
         if (healthChecks <= 2)
@@ -136,8 +136,8 @@ describe('runtime exit store', () => {
         return 2
       if (command === 'get_runtime_info')
         return { service_url: 'http://127.0.0.1:31415' }
-      if (command === 'take_harness_launch_url')
-        return null
+      if (command === 'prepare_harness_webview')
+        return 'http://127.0.0.1:31415'
       if (command === 'proxy_health_check') {
         healthChecks++
         return healthChecks === 1 ? 'Healthy' : 'HARNESS_NOT_READY: transient response'
