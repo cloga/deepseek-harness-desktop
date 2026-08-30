@@ -9,6 +9,7 @@ const DSH_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const DSH_MAX_BACKUPS: usize = 3;
 static DSH_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static PENDING_HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn dsh_log_lock() -> &'static Mutex<()> {
     DSH_LOG_LOCK.get_or_init(|| Mutex::new(()))
@@ -18,9 +19,16 @@ fn harness_launch_url_slot() -> &'static Mutex<Option<String>> {
     HARNESS_LAUNCH_URL.get_or_init(|| Mutex::new(None))
 }
 
+fn pending_harness_launch_url_slot() -> &'static Mutex<Option<String>> {
+    PENDING_HARNESS_LAUNCH_URL.get_or_init(|| Mutex::new(None))
+}
+
 /// 清除上一进程的认证 URL，防止核心重启后复用已经失效的 token。
 pub fn clear_harness_launch_url() {
     *harness_launch_url_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+    *pending_harness_launch_url_slot()
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = None;
 }
@@ -31,6 +39,17 @@ pub fn harness_launch_url(port: u16) -> Option<String> {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone()?;
+    let parsed = reqwest::Url::parse(&value).ok()?;
+    (parsed.host_str() == Some("127.0.0.1") && parsed.port_or_known_default() == Some(port))
+        .then_some(value)
+}
+
+/// 一次性交给尚未挂载的宿主 iframe；取走后远端页面无法再通过 IPC 获取 token。
+pub fn take_harness_launch_url(port: u16) -> Option<String> {
+    let value = pending_harness_launch_url_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()?;
     let parsed = reqwest::Url::parse(&value).ok()?;
     (parsed.host_str() == Some("127.0.0.1") && parsed.port_or_known_default() == Some(port))
         .then_some(value)
@@ -57,6 +76,9 @@ fn capture_and_redact_launch_url(line: &str) -> String {
         return line.to_string();
     }
     *harness_launch_url_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(candidate.to_string());
+    *pending_harness_launch_url_slot()
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(candidate.to_string());
     line.replace(&token, "<redacted>")
@@ -366,6 +388,11 @@ mod tests {
             harness_launch_url(3083).as_deref(),
             Some("http://127.0.0.1:3083/?token=secret-value")
         );
+        assert_eq!(
+            take_harness_launch_url(3083).as_deref(),
+            Some("http://127.0.0.1:3083/?token=secret-value")
+        );
+        assert_eq!(take_harness_launch_url(3083), None);
         assert_eq!(harness_launch_url(3080), None);
         clear_harness_launch_url();
     }

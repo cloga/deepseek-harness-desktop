@@ -386,8 +386,6 @@ pub struct RuntimeInfo {
     pub core_path: Option<String>,
     pub node_version: String,
     pub service_url: String,
-    /// 当前进程的一次性浏览器认证 URL；仅供内嵌 iframe 首次换取 HttpOnly cookie。
-    pub launch_url: Option<String>,
     pub data_dir: String,
     pub log_path: String,
     pub platform: String,
@@ -402,7 +400,6 @@ pub fn runtime_info<R: Runtime>(app: &AppHandle<R>, port: u16) -> RuntimeInfo {
         core_path: None,
         node_version: get_active_node_version(),
         service_url: get_dsh_service_url(port),
-        launch_url: None,
         // 用户数据所在目录 = $DSH_HOME（release 为官方 ~/.dsh，debug 为独立
         // ~/.dsh.dev，见 get_dsh_data_path），不再是 AppData
         data_dir: get_dsh_data_path(app).to_string_lossy().into_owned(),

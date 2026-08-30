@@ -61,12 +61,6 @@ function generateTimestampedUrl(baseUrl: string): string {
 
 interface HarnessRuntimeInfo {
   service_url: string
-  launch_url?: string | null
-}
-
-/** 认证核心优先使用一次性 launch URL；旧核心继续使用普通服务地址。 */
-function runtimeIframeUrl(info: HarnessRuntimeInfo): string {
-  return info.launch_url || info.service_url
 }
 
 /** 健康检查结果：healthy 表示服务就绪；notOwned 表示 dsh 进程已退出（启动即崩溃，快速失败信号） */
@@ -294,7 +288,7 @@ export const harness = defineStore({
         // 后端遇到端口占用时会自动递增并持久化端口，启动后重新读取真实地址。
         const runtimeInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
         this.serviceUrl = runtimeInfo.service_url
-        this.iframeSrc = generateTimestampedUrl(runtimeIframeUrl(runtimeInfo))
+        this.iframeSrc = generateTimestampedUrl(runtimeInfo.service_url)
 
         let healthy = false
         let notOwned = false
@@ -316,8 +310,9 @@ export const harness = defineStore({
         // 旧端口；健康检查通过意味着服务已在最终端口就绪，此时读取必然准确。
         // 避免 iframe 挂载到一个无人监听的地址（表现为首次加载失败、刷新后恢复）。
         const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
+        const launchUrl = await invoke<string | null>('take_harness_launch_url')
         this.serviceUrl = readyInfo.service_url
-        this.iframeSrc = generateTimestampedUrl(runtimeIframeUrl(readyInfo))
+        this.iframeSrc = generateTimestampedUrl(launchUrl || readyInfo.service_url)
         this.serviceHealthy = true
         // 服务（重）启动成功：清空插件异常修复态（若曾进入），并重置已「暂不处理」的插件
         this.recovery = { required: false, info: null, attempts: 0, busy: false }
@@ -367,7 +362,7 @@ export const harness = defineStore({
         }
         const runtimeInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
         this.serviceUrl = runtimeInfo.service_url
-        this.iframeSrc = generateTimestampedUrl(runtimeIframeUrl(runtimeInfo))
+        this.iframeSrc = generateTimestampedUrl(runtimeInfo.service_url)
 
         // 已安装过则跳过安装界面，避免每次启动都闪现"正在安装依赖..."
         const config = await invoke<{

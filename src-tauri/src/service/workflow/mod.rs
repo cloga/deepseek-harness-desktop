@@ -1233,6 +1233,8 @@ pub async fn proxy_health_check(port: u16) -> Result<String, String> {
     if !has_owned_process() {
         return Err(not_owned_probe_signal(LAUNCH_GUARD.load(Ordering::SeqCst)).to_string());
     }
+    let client = utils::loopback_http_client(config::HEALTH_CHECK_TIMEOUT)
+        .map_err(|e| format!("HARNESS_HEALTH_CLIENT_FAILED: {e}"))?;
     // 新核心在 Loader 完成后才打印一次性认证 URL；捕获到它比匿名探测插件
     // bundle 更强，且避免匿名请求因 401 被误判为“服务尚未启动”。
     if let Some(url) = utils::harness_launch_url(port) {
@@ -1258,8 +1260,6 @@ pub async fn proxy_health_check(port: u16) -> Result<String, String> {
             }
         }
     }
-    let client = utils::loopback_http_client(config::HEALTH_CHECK_TIMEOUT)
-        .map_err(|e| format!("HARNESS_HEALTH_CLIENT_FAILED: {e}"))?;
     let mut failures = Vec::with_capacity(2);
 
     for endpoint in utils::health_probe_plugin_urls(port) {
