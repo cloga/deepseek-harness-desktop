@@ -378,7 +378,7 @@ export function ConfigCore() {
                           <Description className="shrink-0 text-xs">
                             {t('core.entry_path')}
                           </Description>
-                          <code className="min-w-0 truncate text-xs text-muted" title={core.path}>
+                          <code className="min-w-0 truncate text-xs text-muted mr-3" title={core.path}>
                             {core.path}
                           </code>
                         </div>
