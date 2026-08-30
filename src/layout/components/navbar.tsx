@@ -23,6 +23,7 @@ import { DesktopUpdateDialog } from '@/components/desktop-update-dialog'
 import { useDshPlugins } from '@/hooks/use-dsh-plugins'
 import { useIframeTauri } from '@/hooks/use-iframe-tauri'
 import { store } from '@/store'
+import { writeClipboardText } from '@/utils/clipboard'
 import { toast } from '@/utils/toast'
 import { useMacOSAppMenu } from './use-macos-app-menu'
 
@@ -150,6 +151,17 @@ export function Navbar({ iframeRef }: NavbarProps) {
       void getCurrentWindow().toggleMaximize()
   }
 
+  function handleDragRegionPointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    // data-tauri-drag-region 原生只监听鼠标事件（mousedown/mouseup），
+    // 触摸屏/笔输入不会触发原生拖拽（见 tauri#13762）。
+    // 这里对非鼠标输入手动调用 startDragging 进入系统边拖边跟随。
+    if (event.pointerType === 'mouse')
+      return
+    // 阻止浏览器生成兼容鼠标事件，避免与 data-tauri-drag-region 的原生拖拽重复触发。
+    event.preventDefault()
+    void getCurrentWindow().startDragging()
+  }
+
   function handleHelpAction(key: string) {
     if (key === 'check-update')
       void handleCheckUpdate()
@@ -185,12 +197,12 @@ export function Navbar({ iframeRef }: NavbarProps) {
   async function copyRunLogs() {
     try {
       const logs = await invoke<string>('read_run_logs')
-      await navigator.clipboard.writeText(logs)
+      await writeClipboardText(logs)
       toast(t('messages.logs_copied'), {})
     }
     catch (err) {
       console.error('[Navbar] failed to copy run logs:', err)
-      toast(t('messages.copy_failed'), {})
+      toast(t('messages.logs_copy_failed'), { variant: 'danger' })
     }
   }
 
@@ -313,10 +325,12 @@ export function Navbar({ iframeRef }: NavbarProps) {
         </Chip>
       </If>
 
-      {/* 拖拽区：Tauri 原生拖拽（仅此元素带 data-tauri-drag-region，按钮不受影响） */}
+      {/* 拖拽区：Tauri 原生拖拽（仅此元素带 data-tauri-drag-region，按钮不受影响）。
+           touch-none 让触摸被当作拖拽而非滚动/平移手势，配合 onPointerDown 支持触摸/笔。 */}
       <div
-        className="min-w-0 flex-1 self-stretch"
+        className="min-w-0 flex-1 self-stretch touch-none"
         data-tauri-drag-region
+        onPointerDown={handleDragRegionPointerDown}
         onDoubleClick={handleDragRegionDoubleClick}
       />
 

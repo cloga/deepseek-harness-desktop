@@ -96,20 +96,87 @@ pub(super) fn loopback_http_client(timeout: Duration) -> Result<reqwest::Client,
         .build()
 }
 
-/// 客户端插件 bundle 探测地址。
+/// 旧版客户端插件 bundle 探测地址。
 ///
 /// SPA `/` 在 webServer 绑定后立刻 200，此时连接桥与 Loader 图往往还没就绪；
 /// WebView 若在这个窗口加载，会永久停在官方 boot 页 “Loading plugins…”。
-/// 必须等到真实 JS bundle（而非 HTML fallback）可取，才视为可挂载 iframe。
+/// 旧版没有可读取的启动图时，保留这两个稳定入口作为兼容兜底。
 pub(super) fn health_probe_plugin_urls(port: u16) -> Vec<String> {
     vec![
-        format!(
-            "http://127.0.0.1:{port}/plugins/@deepseek-ai/dsh-client-ui-layout/client.js"
-        ),
-        format!(
-            "http://127.0.0.1:{port}/plugins/@deepseek-ai/dsh-client-runtime/client.js"
-        ),
+        format!("http://127.0.0.1:{port}/plugins/@deepseek-ai/dsh-client-ui-layout/client.js"),
+        format!("http://127.0.0.1:{port}/plugins/@deepseek-ai/dsh-client-runtime/client.js"),
     ]
+}
+
+/// 从新版 Harness 首页的 `__DSH_BOOT__` 启动图提取客户端 bundle 地址。
+///
+/// alpha 版不再保证桌面端旧适配器中的功能包名称存在，首页注入的启动图才是
+/// WebView 实际会加载的唯一模块清单。这里不猜测替代包名，而是复用该清单中的
+/// `entries`，同时加入 HTML 中预加载的 modules/runtime 两个入口。
+pub(super) fn client_urls_from_boot_html(port: u16, html: &str) -> Option<Vec<String>> {
+    let marker = "globalThis[\"__DSH_BOOT__\"] = ";
+    let start = html.find(marker)? + marker.len();
+    let end = html[start..].find("</script>")? + start;
+    let json = html[start..end].trim().trim_end_matches(';').trim();
+    let boot: serde_json::Value = serde_json::from_str(json).ok()?;
+    let entries = boot.get("entries")?.as_array()?;
+    let mut paths = Vec::new();
+
+    // 预加载脚本不一定重复出现在 entries 的 url 中（例如老的 boot 页面），因此
+    // 两类地址都收集后去重；只接受同源相对的插件 client.js 路径。
+    for script in html.split("<script").skip(1) {
+        let Some(src_start) = script.find("src=\"") else {
+            continue;
+        };
+        let rest = &script[src_start + 5..];
+        let Some(src_end) = rest.find('\"') else {
+            continue;
+        };
+        let src = decode_html_attribute(&rest[..src_end]);
+        if is_client_bundle_path(&src) {
+            paths.push(src);
+        }
+    }
+    for entry in entries {
+        let Some(url) = entry.get("url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let url = decode_html_attribute(url);
+        if is_client_bundle_path(&url) {
+            paths.push(url);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return None;
+    }
+    Some(
+        paths
+            .into_iter()
+            .map(|path| format!("http://127.0.0.1:{port}{path}"))
+            .collect(),
+    )
+}
+
+/// 还原 boot HTML 属性/JSON 中的有限命名实体。
+///
+/// alpha 核心的 combo URL 使用 `&rev=...`，HTML 注入后会变成 `&amp;rev=...`；
+/// 解析前还原它，否则 reqwest 会把实体名当成真实查询参数的一部分。
+fn decode_html_attribute(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn is_client_bundle_path(path: &str) -> bool {
+    // alpha combo 路由合法地使用 `/plugins/??<package>/client.js&rev=...`：
+    // 第一个 `?` 是路由约定，第二个是 combo payload 的起始标记，不能把它拼成
+    // `/plugins/??` 再交给 URL 解析器时丢掉一个问号。
+    path.starts_with("/plugins/") && path.contains("client.js") && !path.starts_with("//")
 }
 
 /// 判断健康检查响应是不是可用的插件 bundle。
@@ -190,41 +257,59 @@ where
     if let Some(stdout) = stdout {
         let log_path = log_path.clone();
         thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        let safe_line = capture_and_redact_launch_url(&line);
-                        log::info!(target: "dsh", "{}", safe_line);
-                        append_log(&log_path, &safe_line);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to read dsh stdout: {}", e);
-                        break;
-                    }
-                }
-            }
+            drain_subprocess_output(BufReader::new(stdout), log_path, log::Level::Info);
         });
     }
 
     // 在独立线程中读取 stderr
     if let Some(stderr) = stderr {
         thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        let safe_line = capture_and_redact_launch_url(&line);
-                        log::warn!(target: "dsh", "{}", safe_line);
-                        append_log(&log_path, &safe_line);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to read dsh stderr: {}", e);
-                        break;
-                    }
-                }
-            }
+            drain_subprocess_output(BufReader::new(stderr), log_path, log::Level::Warn);
         });
+    }
+}
+
+/// 逐行读取子进程输出并写入日志。
+///
+/// 任何一行是非法 UTF-8 时**必须**用 lossy 替换继续读下去，不能中断：管道
+/// 读端一旦被关闭，dsh 主进程下一次写 stderr 就会收到 EPIPE，Node 以退出码 1
+/// 静默崩溃（插件子进程——python MCP 服务器等——在中文本地化 Windows 下按
+/// ANSI 代码页输出 GBK 日志是常态），桌面端表现为 Harness 反复崩溃、WebView
+/// 永久卡在 "Loading plugins"。同样的非法字节在日志里以 U+FFFD 呈现，不影响
+/// 其余行的可读性。真正需要停手的只有 EOF 与管道自身的 I/O 错误。
+fn drain_subprocess_output<R: Read + Send + 'static>(
+    mut reader: BufReader<R>,
+    log_path: PathBuf,
+    level: log::Level,
+) {
+    loop {
+        let mut bytes = Vec::new();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                // 去除行尾 \n / \r\n（与旧 lines() 行为一致）
+                let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+                let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+                let line = capture_and_redact_launch_url(&String::from_utf8_lossy(bytes));
+                match level {
+                    log::Level::Warn => log::warn!(target: "dsh", "{}", line),
+                    _ => log::info!(target: "dsh", "{}", line),
+                }
+                append_log(&log_path, &line);
+            }
+            Err(e) => {
+                log::error!("Failed to read dsh {}: {}", log_level_name(level), e);
+                break;
+            }
+        }
+    }
+}
+
+/// `log::Level` 的小写名称（内部日志用词与旧实现一致）。
+fn log_level_name(level: log::Level) -> &'static str {
+    match level {
+        log::Level::Warn => "stderr",
+        _ => "stdout",
     }
 }
 
@@ -254,7 +339,11 @@ fn append_log(log_path: &PathBuf, line: &str) {
             if log_path.exists() {
                 let _ = std::fs::rename(log_path, indexed_log_path(log_path, 1));
             }
-            let _ = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(log_path);
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(log_path);
         }
     }
 }
@@ -264,10 +353,7 @@ fn indexed_log_path(log_path: &PathBuf, index: usize) -> PathBuf {
     if index == 0 {
         return log_path.clone();
     }
-    let mut name = log_path
-        .file_name()
-        .unwrap_or_default()
-        .to_os_string();
+    let mut name = log_path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{}", index));
     log_path.with_file_name(name)
 }
@@ -311,14 +397,74 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
+    /// 回归：非法 UTF-8 行（中文 Windows 下 python 插件输出 GBK 的典型形态）
+    /// 绝不能让读取器中断——旧实现 break 会关闭管道读端，dsh 下次写 stderr
+    /// 收到 EPIPE 以退出码 1 崩溃，表现为 Harness 崩溃循环 + WebView 卡在
+    /// "Loading plugins"。
+    #[test]
+    fn drain_keeps_reading_after_invalid_utf8_lines() {
+        let dir = std::env::temp_dir().join(format!("dsh_drain_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("out.log");
+
+        // "因为测试" 的 GBK 编码（与系统 ANSI 代码页 936 输出一致）
+        let mut data = b"first line\n".to_vec();
+        data.extend_from_slice(b"\xd2\xf2\xce\xaa\xb2\xe2\xca\xd4\n");
+        data.extend_from_slice(b"second line\n");
+
+        drain_subprocess_output(
+            std::io::BufReader::new(std::io::Cursor::new(data)),
+            log.clone(),
+            log::Level::Warn,
+        );
+
+        let content = fs::read_to_string(&log).unwrap();
+        assert!(
+            content.contains("first line"),
+            "first line must be logged, got: {content:?}"
+        );
+        assert!(
+            content.contains("second line"),
+            "reader must NOT stop at invalid UTF-8 (old code broke and closed the pipe); got: {content:?}"
+        );
+        // 非法字节以 U+FFFD 呈现，行内容不丢失
+        assert!(content.contains('\u{FFFD}'));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `log::Level` 与日志名称的映射。
+    #[test]
+    fn log_level_name_maps_streams() {
+        assert_eq!(log_level_name(log::Level::Warn), "stderr");
+        assert_eq!(log_level_name(log::Level::Info), "stdout");
+        assert_eq!(log_level_name(log::Level::Debug), "stdout");
+    }
+
+    /// 行尾处理与旧 `lines()` 行为一致：\n 与 \r\n 均被剥离。
+    #[test]
+    fn drain_strips_line_endings() {
+        let dir = std::env::temp_dir().join(format!("dsh_drain_crlf_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("out.log");
+
+        drain_subprocess_output(
+            std::io::BufReader::new(std::io::Cursor::new(b"a\r\nb\n".to_vec())),
+            log.clone(),
+            log::Level::Info,
+        );
+
+        let content = fs::read_to_string(&log).unwrap();
+        assert_eq!(content, "a\nb\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 模拟连续 5 次启动，验证磁盘上始终只保留最近 `keep` 份日志，
     /// 且每次启动都会新建当前日志文件。
     #[test]
     fn rotate_keeps_only_last_three_starts() {
-        let dir = std::env::temp_dir().join(format!(
-            "dsh_rotate_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("dsh_rotate_test_{}", std::process::id()));
         let log = dir.join("dsh-web.log");
         let _ = fs::remove_dir_all(&dir);
 
@@ -347,16 +493,47 @@ mod tests {
     }
 
     #[test]
+    fn boot_html_uses_declared_client_graph() {
+        let html = r#"<script src="/plugins/@deepseek-ai/dsh-client-modules/client.js?rev=one"></script><script>globalThis["__DSH_BOOT__"] = {"rev":"graph","entries":[{"id":"@deepseek-ai/dsh-client-ui-layout","url":"/plugins/@deepseek-ai/dsh-client-ui-layout/client.js?rev=two","rev":"two"}]}</script>"#;
+        let urls = client_urls_from_boot_html(3099, html).expect("boot graph");
+        assert_eq!(urls.len(), 2);
+        assert!(urls
+            .iter()
+            .any(|url| url.contains("dsh-client-modules/client.js")));
+        assert!(urls
+            .iter()
+            .any(|url| url.contains("dsh-client-ui-layout/client.js")));
+        assert!(urls
+            .iter()
+            .all(|url| url.starts_with("http://127.0.0.1:3099/plugins/")));
+    }
+
+    #[test]
+    fn boot_html_rejects_missing_or_external_graph_entries() {
+        assert!(client_urls_from_boot_html(3099, "<html></html>").is_none());
+        let html = r#"<script>globalThis[\"__DSH_BOOT__\"] = {\"entries\":[{\"url\":\"https://example.test/client.js\"}]}</script>"#;
+        assert!(client_urls_from_boot_html(3099, html).is_none());
+    }
+
+    /// alpha combo bundle 的 script src 位于 HTML 属性时，`&rev=` 会编码为
+    /// `&amp;rev=`；探测 URL 必须先还原实体，否则服务端收到错误资源地址并返回 404。
+    #[test]
+    fn boot_html_decodes_combo_bundle_attribute_url() {
+        let html = r#"<script src="/plugins/??@deepseek-ai/dsh-client-modules/client.js&amp;rev=cddf5581d5d5"></script><script>globalThis["__DSH_BOOT__"] = {"entries":[]}</script>"#;
+        let urls = client_urls_from_boot_html(3081, html).expect("boot graph");
+        assert_eq!(urls, vec!["http://127.0.0.1:3081/plugins/??@deepseek-ai/dsh-client-modules/client.js&rev=cddf5581d5d5"]);
+    }
+
+    #[test]
     fn health_probe_plugin_urls_target_client_bundles_not_spa_root() {
         let urls = health_probe_plugin_urls(3080);
         assert!(urls.iter().all(|u| u.contains("/plugins/")));
         assert!(urls
             .iter()
             .all(|u| !u.ends_with("3080/") && !u.ends_with("://127.0.0.1:3080")));
-        assert!(
-            urls.iter()
-                .any(|u| u.contains("dsh-client-ui-layout/client.js"))
-        );
+        assert!(urls
+            .iter()
+            .any(|u| u.contains("dsh-client-ui-layout/client.js")));
     }
 
     #[test]
@@ -365,9 +542,15 @@ mod tests {
             true,
             "<!doctype html><html lang=\"en\"><body>HARNESS Loading plugins...</body></html>"
         ));
-        assert!(!looks_like_plugin_bundle(true, "<html><head></head></html>"));
+        assert!(!looks_like_plugin_bundle(
+            true,
+            "<html><head></head></html>"
+        ));
         assert!(!looks_like_plugin_bundle(true, "   "));
-        assert!(!looks_like_plugin_bundle(false, "window.__ModuleLoader__={}"));
+        assert!(!looks_like_plugin_bundle(
+            false,
+            "window.__ModuleLoader__={}"
+        ));
         assert!(looks_like_plugin_bundle(
             true,
             "window.__ModuleLoader__.load({id:\"@deepseek-ai/dsh-client-ui-layout\"})"
@@ -408,10 +591,7 @@ mod tests {
     /// keep=0 时把当前日志也删掉。
     #[test]
     fn rotate_with_keep_zero_removes_all() {
-        let dir = std::env::temp_dir().join(format!(
-            "dsh_rotate_zero_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("dsh_rotate_zero_{}", std::process::id()));
         let log = dir.join("dsh-web.log");
         let _ = fs::remove_dir_all(&dir);
         write(&log, "x");

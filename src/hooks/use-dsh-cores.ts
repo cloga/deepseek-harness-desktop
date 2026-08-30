@@ -23,6 +23,13 @@ export interface HarnessCore {
   present: boolean
   /** 当前是否使用中 */
   active: boolean
+  /** 是否预览版（GitHub Pre-release label 或 tag 命名判定）：预览版不参与更新提示，仅列表展示 */
+  preview: boolean
+  /** 是否高于 resources/version-recommend.json 中的推荐版本 */
+  aboveRecommended: boolean
+  /** 本地存在但 pkg 仓库已不再提供的历史槽位 */
+  orphaned: boolean
+  recommendedVersion: string | null
   error?: string | null
 }
 
@@ -38,6 +45,8 @@ export interface UseDshCoresResult {
   removeCore: (id: string) => Promise<void>
   /** 通过用户包管理器 CLI 更新本地核心，返回更新后的版本号 */
   updateLocalCore: () => Promise<string>
+  /** 手动刷新核心列表 */
+  refreshCores: () => Promise<void>
   /** 操作进行中标记 */
   busy: boolean
 }
@@ -102,9 +111,9 @@ export function useDshCores(): UseDshCoresResult {
     loading: isLoading,
     error: error ? String(error) : '',
     setActiveCore: async (id) => {
-      const activated = await activate.mutateAsync(id)
-      await refetch()
-      return activated
+      // 激活后由 restart 完成时统一失效核心查询；这里不等待联网列表重拉，
+      // 避免 setting 已切换但旧服务仍运行期间人为扩大竞态窗口。
+      return activate.mutateAsync(id)
     },
     downloadCore: async (tag) => {
       const core = await download.mutateAsync(tag)
@@ -119,6 +128,9 @@ export function useDshCores(): UseDshCoresResult {
       const version = await update.mutateAsync()
       await refetch()
       return version
+    },
+    refreshCores: async () => {
+      await refetch()
     },
     busy: activate.isPending || download.isPending || remove.isPending || update.isPending,
   }

@@ -9,14 +9,11 @@ use tauri::{
     ipc::Invoke,
     menu::{Menu, MenuEvent, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
-    Emitter, Runtime, WebviewUrl, WebviewWindowBuilder, Wry,
+    Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, Wry,
 };
 
 #[cfg(target_os = "macos")]
-use tauri::{
-    menu::{PredefinedMenuItem, Submenu},
-    Manager,
-};
+use tauri::menu::{PredefinedMenuItem, Submenu};
 
 #[cfg(target_os = "macos")]
 static MACOS_FULLSCREEN_MENU_ITEM: OnceLock<Mutex<Option<PredefinedMenuItem<Wry>>>> =
@@ -27,8 +24,27 @@ use crate::desktop::window::on_page_load;
 use crate::desktop::window::{on_download, on_new_window};
 use crate::utils::show_main_window;
 
+/// WebView2 原生拖拽区域所需的参数。
+///
+/// `data-tauri-drag-region` 的兼容脚本只处理鼠标事件；WebView2 的原生
+/// `app-region: drag` 才能让触摸输入进入窗口非客户区拖拽。ElasticOverscroll
+/// 会抢走触摸手势，因此必须同时禁用。Wry 的默认安全功能保持启用。
+#[cfg(windows)]
+const WINDOWS_DRAG_BROWSER_ARGS: &str = "--enable-features=msWebView2EnableDraggableRegions --disable-features=ElasticOverscroll,msWebOOUI,msPdfOOUI";
+
+#[cfg(windows)]
+fn windows_drag_browser_args() -> &'static str {
+    WINDOWS_DRAG_BROWSER_ARGS
+}
+
 /// setup app
 pub fn setup(app_handle: tauri::AppHandle) {
+    // 升级清理：内部插件资源已迁至 resources/internal-plugins；旧安装可能保留
+    // resources/preset-plugins 目录。仅删除旧目录，失败告警并继续启动。
+    if let Err(e) = crate::service::plugin::remove_legacy_bundled_plugins(&app_handle) {
+        log::warn!("legacy preset plugins cleanup skipped: {e}");
+    }
+
     // 启动前清扫上次崩溃残留的孤儿 Harness（端口/PID 双重确认，见
     // workflow::sweep_orphan_harness），避免新实例一路漂移端口
     crate::service::workflow::sweep_orphan_harness(&app_handle);
@@ -238,7 +254,8 @@ pub fn install_macos_menu(app: &tauri::AppHandle<Wry>) -> tauri::Result<()> {
     let cut = PredefinedMenuItem::cut(app, Some(&crate::config::i18n::t("menu.cut")))?;
     let copy = PredefinedMenuItem::copy(app, Some(&crate::config::i18n::t("menu.copy")))?;
     let paste = PredefinedMenuItem::paste(app, Some(&crate::config::i18n::t("menu.paste")))?;
-    let select_all = PredefinedMenuItem::select_all(app, Some(&crate::config::i18n::t("menu.select_all")))?;
+    let select_all =
+        PredefinedMenuItem::select_all(app, Some(&crate::config::i18n::t("menu.select_all")))?;
     let edit_separator_after_redo = PredefinedMenuItem::separator(app)?;
     let edit_separator_before_select_all = PredefinedMenuItem::separator(app)?;
     let edit_menu = Submenu::with_id_and_items(
@@ -325,7 +342,24 @@ pub fn build_main_window(app: &tauri::AppHandle<Wry>) -> tauri::Result<tauri::We
     // Windows/WebView2 在 build() 尚未返回时就可能绘制窗口。先隐藏创建，
     // 等保存的几何恢复完成再显示，避免启动时先闪出默认尺寸再跳到历史尺寸。
     #[cfg(windows)]
-    let webview_builder = webview_builder.visible(false);
+    let webview_builder = webview_builder
+        .visible(false)
+        // 开发版使用独立 WebView2 数据目录，避免已有 release 实例、热重启残留
+        // 或其他同标识实例占用同一 User Data 管道，触发 HRESULT 0x8007139F。
+        .data_directory({
+            let mut directory = app
+                .path()
+                .app_local_data_dir()
+                .expect("Failed to resolve app local data directory");
+            directory.push(if cfg!(debug_assertions) {
+                "EBWebView-dev"
+            } else {
+                "EBWebView"
+            });
+            directory
+        })
+        // WebView2 原生非客户区可直接接收触摸输入；同时禁用会抢占手势的弹性滚动。
+        .additional_browser_args(windows_drag_browser_args());
 
     // macOS 保留原生交通灯：绿色按钮由 AppKit 进入独立 Space 的原生全屏，
     // 同时用 Overlay 让 44px 壳层导航栏继续与窗口 chrome 融合。其他平台
@@ -376,8 +410,8 @@ pub fn build_main_window(app: &tauri::AppHandle<Wry>) -> tauri::Result<tauri::We
     });
 
     // 非 Windows（macOS/Linux）没有 WebView2 的 FrameCreated/ContentLoading 流程，
-    // 直接用 Tauri 的 initialization_script_for_all_frames 把兼容桥、通知桥、导航桥
-    // 与样式桥注入所有 frame（脚本均带 window.__dsh_*_bridge__ 幂等守卫，重复注入安全）。
+    // 直接用 Tauri 的 initialization_script_for_all_frames 把兼容桥、通知桥、导航桥、
+    // 样式桥与缩放快捷键桥注入所有 frame（脚本均带幂等守卫，重复注入安全）。
     #[cfg(not(windows))]
     let webview_builder = webview_builder
         .initialization_script_for_all_frames(crate::desktop::compat::ABORT_SIGNAL_ANY_SHIM_JS)
@@ -385,9 +419,16 @@ pub fn build_main_window(app: &tauri::AppHandle<Wry>) -> tauri::Result<tauri::We
         .initialization_script_for_all_frames(crate::desktop::nav::NAV_SHIM_JS)
         .initialization_script_for_all_frames(crate::desktop::style::IFRAME_STYLES_JS)
         .initialization_script_for_all_frames(crate::desktop::paste::PASTE_SHIM_JS)
-        .initialization_script_for_all_frames(crate::desktop::plugin_boot::PLUGIN_BOOT_RELOAD_JS);
+        .initialization_script_for_all_frames(crate::desktop::plugin_boot::PLUGIN_BOOT_RELOAD_JS)
+        .initialization_script_for_all_frames(crate::desktop::zoom::ZOOM_SHORTCUT_BRIDGE_JS);
 
     let webview_window = webview_builder.build()?;
+    let zoom_factor = crate::config::get_store_dat_setting(app).zoom_factor;
+    if zoom_factor != crate::config::default_zoom_factor() {
+        if let Err(error) = crate::desktop::zoom::apply_native_zoom(&webview_window, zoom_factor) {
+            log::warn!("[zoom] startup zoom was not applied: {error}");
+        }
+    }
 
     // 恢复上次的窗口大小/位置/最大化状态（无历史时保持 builder 默认的 1280×840，
     // 由 Tauri 自动居中；见 config::window_state）。
@@ -416,6 +457,40 @@ pub fn build_main_window(app: &tauri::AppHandle<Wry>) -> tauri::Result<tauri::We
     Ok(webview_window)
 }
 
+#[cfg(all(test, windows))]
+mod tests {
+    use super::windows_drag_browser_args;
+
+    #[test]
+    fn windows_drag_args_enable_touch_drag_and_disable_overscroll() {
+        let args = windows_drag_browser_args();
+        assert!(args.contains("--enable-features=msWebView2EnableDraggableRegions"));
+        assert!(args.contains("--disable-features=ElasticOverscroll"));
+        assert!(args.contains("msWebOOUI,msPdfOOUI"));
+        let smart_screen = ["ms", "SmartScreen", "Protection"].concat();
+        assert!(!args.contains(smart_screen.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    #[test]
+    fn remote_capability_allows_only_loopback_harness() {
+        let capability = include_str!("../../capabilities/default.json");
+        assert!(capability.contains("\"remote\""));
+        let wildcard_loopback = ["http://127.0.0.1:", "*"].concat();
+        assert!(capability.contains(wildcard_loopback.as_str()));
+        assert!(!capability.contains("https://"));
+    }
+
+    #[test]
+    fn webview_security_features_are_not_disabled() {
+        let source = include_str!("builder.rs");
+        let smart_screen = ["ms", "SmartScreen", "Protection"].concat();
+        assert!(!source.contains(smart_screen.as_str()));
+    }
+}
+
 // configure invoke handler
 pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
@@ -431,6 +506,7 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::bridge::cancel_preinstall_plugins,
         crate::bridge::skip_preinstall_plugins,
         crate::bridge::ensure_internal_plugins,
+        crate::bridge::cancel_internal_plugins,
         crate::bridge::open_preinstall_repo,
         crate::bridge::get_dsh_plugins,
         crate::bridge::refresh_plugin_updates,
@@ -454,6 +530,10 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::bridge::runtime_ready,
         crate::bridge::get_app_config,
         crate::bridge::update_app_config,
+        crate::bridge::get_launch_on_login,
+        crate::bridge::set_launch_on_login,
+        crate::bridge::set_webview_zoom,
+        crate::bridge::adjust_webview_zoom,
         crate::bridge::get_cli_link_status,
         crate::bridge::open_in_browser,
         crate::bridge::copy_service_url,
@@ -531,6 +611,12 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     }));
 
     builder
+        // 官方跨平台登录启动实现：Windows HKCU Run、macOS LaunchAgent、Linux XDG。
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name(crate::desktop::autostart::app_name())
+                .build(),
+        )
         // Opener plugin
         .plugin(tauri_plugin_opener::init())
         // Notification plugin（Windows 上以 tauri-winrt-notification 实现点击回调，

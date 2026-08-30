@@ -5,6 +5,13 @@
 
 @import "./components/scrollbar.css";
 
+/* WebView2 123+ 的原生拖拽区域支持触摸屏；Windows runtime 110+ 通过
+   msWebView2EnableDraggableRegions 参数启用。按钮不在该区域内，故无需 no-drag。 */
+[data-tauri-drag-region] {
+  app-region: drag;
+  -webkit-app-region: drag;
+}
+
 /* 主题变量：默认深色，html[data-theme="light"] 切换到浅色。
    取值与官方 dsw alias token（design-platform.css）逐项一致 */
 :root {

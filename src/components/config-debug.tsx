@@ -2,13 +2,18 @@ import { ArrowRotateRight, ArrowUpRightFromSquare, ChevronRight, Copy, Folder, P
 import { Button, Chip, Description, Input, Link, ListBox, Select, Spinner, Surface, Switch } from '@heroui/react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { invoke } from '@tauri-apps/api/core'
-import { useState } from 'react'
+import { listen } from '@tauri-apps/api/event'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
 import { useStore } from 'valtio-define'
 import { store } from '@/store'
+import { writeClipboardText } from '@/utils/clipboard'
 import { toast } from '@/utils/toast'
+import { ConfigLaunchOnLogin } from './config-launch-on-login'
 import { Info } from './info'
+
+const ZOOM_OPTIONS = Array.from({ length: 16 }, (_, index) => Number((0.5 + index * 0.1).toFixed(1)))
 
 export interface RuntimeInfo {
   app_version: string
@@ -35,6 +40,7 @@ export interface AppConfig {
   port: number
   auto_start: boolean
   cli_link_enabled: boolean
+  zoom_factor: number
 }
 
 export function ConfigDebug() {
@@ -47,10 +53,27 @@ export function ConfigDebug() {
   // 读取 config 数据；用户一旦输入即以输入值为准。
   const [portInput, setPortInput] = useState<number>()
 
-  const { data: info } = useQuery({
+  const { data: info, refetch: refreshInfo } = useQuery({
     queryKey: ['info'],
     queryFn: () => invoke<RuntimeInfo>('get_runtime_info'),
   })
+
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    listen('setting_updated', () => {
+      void refreshInfo()
+    }).then((fn) => {
+      if (disposed)
+        fn()
+      else
+        unlisten = fn
+    }).catch(() => {})
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [refreshInfo])
 
   const { data: config, refetch: refreshConfig } = useQuery({
     queryKey: ['config'],
@@ -68,6 +91,17 @@ export function ConfigDebug() {
     queryFn: () => invoke<string>('read_service_logs'),
     refetchInterval: 2000,
   })
+
+  async function copyLogs() {
+    try {
+      await writeClipboardText(logs || '')
+      toast(t('messages.logs_copied'))
+    }
+    catch (err) {
+      console.error('[ConfigDebug] copy logs failed:', err)
+      toast(t('messages.logs_copy_failed'), { variant: 'danger' })
+    }
+  }
 
   const { mutate: onClearLogs } = useMutation({
     mutationFn: async () => {
@@ -89,6 +123,17 @@ export function ConfigDebug() {
     onError: (err: unknown) => {
       console.error('[ConfigDebug] toggle cli link failed:', err)
       toast(t('messages.cli_link_failed'), { variant: 'danger' })
+    },
+  })
+
+  const { mutate: onSetZoom } = useMutation({
+    mutationFn: async (zoomFactor: number) => {
+      await invoke<number>('set_webview_zoom', { zoomFactor })
+      await refreshConfig()
+    },
+    onError: (err: unknown) => {
+      console.error('[ConfigDebug] set zoom failed:', err)
+      toast(t('messages.zoom_failed'), { variant: 'danger' })
     },
   })
 
@@ -266,6 +311,7 @@ export function ConfigDebug() {
       </div>
       <div className="border-t border-line/30" />
       <div className="space-y-1.5">
+        <ConfigLaunchOnLogin />
         <div>
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-ink">{t('ui.cli_link_enabled')}</span>
@@ -342,6 +388,35 @@ export function ConfigDebug() {
             </Select.Popover>
           </Select>
         </div>
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-ink">{t('ui.zoom')}</span>
+          <Select
+            variant="secondary"
+            selectedKey={String(config?.zoom_factor ?? 1)}
+            onSelectionChange={key => onSetZoom(Number(key))}
+            className="w-[80px]"
+            aria-label={t('ui.zoom')}
+          >
+            <Select.Trigger className="rounded-md min-h-8! h-8 py-0 items-center">
+              <Select.Value />
+              <Select.Indicator />
+            </Select.Trigger>
+            <Select.Popover className="rounded-md">
+              <ListBox>
+                {ZOOM_OPTIONS.map(zoomFactor => (
+                  <ListBox.Item
+                    className="rounded-md min-h-8!"
+                    id={String(zoomFactor)}
+                    key={zoomFactor}
+                    textValue={`${Math.round(zoomFactor * 100)}%`}
+                  >
+                    {`${Math.round(zoomFactor * 100)}%`}
+                  </ListBox.Item>
+                ))}
+              </ListBox>
+            </Select.Popover>
+          </Select>
+        </div>
       </div>
 
       <div className="border-t border-line/30" />
@@ -355,10 +430,7 @@ export function ConfigDebug() {
               size="sm"
               className="rounded-md size-6"
               variant="ghost"
-              onPress={async () => {
-                await navigator.clipboard.writeText(logs || '')
-                toast(t('messages.logs_copied'))
-              }}
+              onPress={() => { void copyLogs() }}
             >
               <Copy className="scale-80" />
             </Button>

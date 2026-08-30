@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 use crate::config;
 use crate::service::cli;
+use crate::service::core;
 use crate::service::download::{self, Installable};
 use crate::service::workflow;
 use tauri::AppHandle;
@@ -16,6 +17,11 @@ use tauri::AppHandle;
 /// 改用独立的进程内互斥锁覆盖完整安装生命周期，避免两路并发 install 的
 /// TOCTOU 与安装失败后状态卡死导致后续请求被静默跳过。
 static INSTALL_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+/// 返回当前实际选中的核心版本，不能直接读取固定预打包目录。
+fn active_dsh_version(app_handle: &AppHandle) -> Option<String> {
+    core::active_version(app_handle).or_else(|| config::get_dsh_version(app_handle))
+}
 
 fn install_lock() -> &'static tokio::sync::Mutex<()> {
     INSTALL_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -69,6 +75,9 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
     // 升级后 `installed` 已为 true 会跳过环境安装，捆绑 pnpm 可能从未落盘，
     // 需一并纳入"已就绪"判定，缺失时由 workflow::install 按任务补齐。
     let pnpm_ok = download::Pnpm.check_installed(&app_handle);
+    // Windows 空白环境还必须有可执行的 Git，才能安装 github:/git+ssh: 插件。
+    // 非 Windows 返回 true，保持原有依赖集合不变。
+    let git_ok = config::git_runtime_ready(&app_handle);
 
     // 启动自愈捷径：记录显示未安装、但运行时文件已全部在盘。常见于桌面端自更新
     // 安装器强杀进程，或上次启动时核心文件短暂缺失被 workflow::start 复位
@@ -77,7 +86,7 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
     // 误判为真更新，而重下整目录在 Windows 上极易破坏 node_modules（历史 issue：
     // 重解压后启动报找不到 @deepseek-ai/dsh-client-ui-settings）。真更新一律由
     // 启动后的 check_dsh_update 提示用户手动安装，启动路径不该自行下载。
-    if node_ok && dsh_files_ok && pnpm_ok {
+    if node_ok && dsh_files_ok && pnpm_ok && git_ok {
         let setting = config::get_store_dat_setting(&app_handle);
         if !setting.installed {
             log::info!(
@@ -91,6 +100,22 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
         }
     }
 
+    // 老版本升级后 installed 仍为 true，但可能缺少新版新增的 Windows Git 依赖。
+    // 其余三项均就绪时直接走本地任务跳过 + Git 补装，不查询 Harness 最新版本，
+    // 避免一次依赖自愈意外触发核心更新。
+    if node_ok && dsh_files_ok && pnpm_ok && !git_ok {
+        log::info!("Git dependency missing, provisioning bundled MinGit without core update check");
+        workflow::status::set_status(workflow::status::Status::Installing);
+        workflow::status::emit_status(&app_handle);
+        if let Err(e) = workflow::install(&app_handle, None).await {
+            log::error!("Git dependency installation failed, resetting status: {e}");
+            reset_install_status(&app_handle);
+            return Err(e);
+        }
+        sync_cli_link(&app_handle);
+        return Ok(false);
+    }
+
     let dsh_latest = download::fetch_latest_dsh_pkg_info().await;
 
     // 已安装文件在盘时，用 resolve_update 甄别「记录滞后」与「真更新」：
@@ -99,10 +124,22 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
     // 很容易留下破损安装，导致启动报找不到 @deepseek-ai/dsh-client-ui-settings
     // 或 HARNESS_NOT_FOUND。仅在真更新（UpdateAvailable）时才允许重新下载。
     let dsh_need_install = match &dsh_latest {
+        Ok(latest)
+            if dsh_files_ok
+                && download::parse_version_from_tag(&latest.tag).is_some_and(|version| {
+                    config::is_dsh_version_above_recommended(&app_handle, &version)
+                }) =>
+        {
+            log::info!(
+                "Recommended version policy prevents automatic dsh installation: {}",
+                latest.tag
+            );
+            false
+        }
         Ok(latest) if dsh_files_ok => {
             let record_commit = config::get_dsh_pkg_commit(&app_handle);
             let record_tag = config::get_dsh_pkg_tag(&app_handle);
-            let installed_version = config::get_dsh_version(&app_handle);
+            let installed_version = active_dsh_version(&app_handle);
             // 老记录没有 tag，反查 pkg 仓库 tags 列表确认记录对应的发布版本；
             // 反查失败时由 resolve_update 回退到“以实际文件为准”的保守分支
             let legacy_tags = if record_tag.is_none() {
@@ -119,8 +156,7 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
             ) {
                 // 安装文件已是最新 release，只是记录滞后：修正记录后下次
                 // 启动直接走 commit 快速比对，不再误判、也绝不整包重下
-                download::UpdateCheck::UpToDate
-                | download::UpdateCheck::HealUpToDate => {
+                download::UpdateCheck::UpToDate | download::UpdateCheck::HealUpToDate => {
                     if record_commit.as_deref() != Some(latest.commit.as_str()) {
                         log::info!(
                             "Installed Harness files already at latest release, healing stale record: {} ({})",
@@ -160,7 +196,7 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
         }
     };
 
-    if node_ok && !dsh_need_install && pnpm_ok {
+    if node_ok && !dsh_need_install && pnpm_ok && git_ok {
         log::info!("Dependencies already installed and up to date, skipping installation");
         let mut setting = config::get_store_dat_setting(&app_handle);
         if !setting.installed {
@@ -209,10 +245,40 @@ pub async fn check_dsh_update(
         return Ok(None);
     }
 
+    // 当前运行的是预览版时不提示稳定/RC 更新：预览版可能高于当前 release，
+    // 但不能把用户主动选择的 alpha/beta 版本降级成较旧的 rc。
+    if config::get_store_dat_setting(&app_handle).active_core.as_deref() == Some("app")
+        && config::get_dsh_pkg_tag(&app_handle).as_deref().is_some_and(download::is_preview_tag)
+    {
+        log::info!("Suppressing dsh update because a preview core is active");
+        return Ok(None);
+    }
+
+    // 当前已运行版本高于推荐版本时也不提示更新；否则从高版本核心切换后，
+    // latest release 仍可能被误判为更新并再次弹出通知。
+    if let Some(installed_version) = active_dsh_version(&app_handle) {
+        if config::is_dsh_version_above_recommended(&app_handle, &installed_version) {
+            log::info!(
+                "Suppressing dsh update because installed version is above recommended: {}",
+                installed_version
+            );
+            return Ok(None);
+        }
+    }
+
     let latest = download::fetch_latest_dsh_pkg_info().await?;
+    if let Some(version) = download::parse_version_from_tag(&latest.tag) {
+        if config::is_dsh_version_above_recommended(&app_handle, &version) {
+            log::info!(
+                "Suppressing dsh update above recommended version: {}",
+                version
+            );
+            return Ok(None);
+        }
+    }
     let record_commit = config::get_dsh_pkg_commit(&app_handle);
     let record_tag = config::get_dsh_pkg_tag(&app_handle);
-    let installed_version = config::get_dsh_version(&app_handle);
+    let installed_version = active_dsh_version(&app_handle);
 
     // 老记录没有 tag，反查 pkg 仓库 tags 列表确认记录对应的发布版本；
     // 反查失败时由 resolve_update 回退到“以实际文件为准”的保守分支
@@ -270,7 +336,8 @@ pub fn get_dsh_status() -> workflow::status::Status {
     workflow::status::get_status()
 }
 
-/// 运行时文件是否已全部在盘（Node / Dsh / pnpm 三件套，纯本地检查、无网络）。
+/// 运行时文件是否已全部在盘（Node / Dsh / pnpm；Windows 还要求 Git 可用，
+/// 纯本地检查、无网络）。
 ///
 /// 判定条件与 `install_dependencies` 的「启动自愈」捷径完全一致：桌面端自更新
 /// （MSI 强杀进程）后 store 可能被复位或损坏显示「未安装」，但运行时文件其实
@@ -281,6 +348,7 @@ pub fn runtime_ready(app_handle: AppHandle) -> bool {
     download::Nodejs.check_installed(&app_handle)
         && download::Dsh.check_installed(&app_handle)
         && download::Pnpm.check_installed(&app_handle)
+        && config::git_runtime_ready(&app_handle)
 }
 
 #[cfg(test)]

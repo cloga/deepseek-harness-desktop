@@ -1,6 +1,7 @@
 /* eslint-disable no-control-regex */
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import type {
+  HarnessProcessExitedPayload,
   InstallerState,
   InstallProgress,
   InternalPluginsPhasePayload,
@@ -11,17 +12,28 @@ import type {
   SetupStatus,
   SidebarBusyAction,
 } from './types'
+import type { ReadinessPollResult, ReadinessProbeResult, StartupPhase } from '@/utils/readiness'
 import { emitter } from '@hairy/react-lib'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import i18next from 'i18next'
 import { defineStore } from 'valtio-define'
 import { queryClient } from '@/config/client'
-import { pickErrorLines } from '@/utils/log'
+import { internalPluginReason } from '@/utils/internal-plugin-phase'
+import { containsInotifyLimitError, pickErrorLines } from '@/utils/log'
+import { BoundedReloadGate, pollReadiness, SingleFlight, waitForActivityTask } from '@/utils/readiness'
+import { runtimeExitMessageKey, shouldAcceptRuntimeExit } from '@/utils/runtime-exit'
 import { harnessUpdater } from '../harness-updater'
 
-const MAX_RETRIES = 8
 const IFRAME_LOAD_TIMEOUT = 20000
+const HEALTH_PROBE_INITIAL_INTERVAL = 1000
+const HEALTH_PROBE_MAX_INTERVAL = 5000
+const STARTUP_INACTIVITY_TIMEOUT = 180000
+const STARTUP_ABSOLUTE_TIMEOUT = 300000
+const PLUGIN_INACTIVITY_TIMEOUT = 30000
+const PLUGIN_ABSOLUTE_TIMEOUT = 600000
+const PLUGIN_ACTIVITY_CHECK_INTERVAL = 1000
+const IFRAME_RECOVERY_ABSOLUTE_TIMEOUT = 60000
 /** 启动失败时从服务日志尾部挑选的原始行上限（ANSI 清洗后按行截断） */
 const LOG_TAIL_MAX_BYTES = 16 * 1024
 
@@ -31,6 +43,10 @@ interface StartupError extends Error {
   /** 完整清洗后的日志尾（供插件异常定位使用，非仅错误行） */
   logLines?: string[]
   pluginConflictHint?: string
+  /** Linux inotify 文件监视上限（ENOSPC）导致服务启动即崩溃时的针对性提示 */
+  inotifyLimitHint?: string
+  phase?: StartupPhase
+  lastReason?: string
 }
 
 const initialInstaller: InstallerState = {
@@ -49,10 +65,17 @@ const initialRecovery: RecoveryState = {
 
 /** 启动流程令牌：boot 并发/重复调用时只采纳最后一次的结果 */
 let bootToken = 0
+/** 最终健康复核到 ready 提交之间的启动代；退出事件可使该提交失效。 */
+let readinessCommitToken: number | null = null
 /** 首次自动启动去重（React StrictMode 会重复挂载 effect） */
 let bootStarted = false
+let pluginActivitySequence = 0
+let pluginActivityReason = ''
+const restartFlight = new SingleFlight<void>()
+const iframeReloadGate = new BoundedReloadGate(3)
+let iframeRefreshTimer: ReturnType<typeof setTimeout> | undefined
 
-/** 构建带时间戳的 iframe URL，避免 WebView2 缓存旧页面 */
+/** 构建带时间戳的 iframe URL，避免 WebView2 缓存旧页面。 */
 function generateTimestampedUrl(baseUrl: string): string {
   const timestamp = Date.now()
   const separator = baseUrl.includes('?') ? '&' : '?'
@@ -63,42 +86,46 @@ interface HarnessRuntimeInfo {
   service_url: string
 }
 
-/** 健康检查结果：healthy 表示服务就绪；notOwned 表示 dsh 进程已退出（启动即崩溃，快速失败信号） */
-interface HealthCheckResult {
-  healthy: boolean
-  notOwned: boolean
-}
-
 /** 通过 Rust 代理探测服务健康状态（超时 8s，网络抖动时重试） */
-async function checkHealthViaProxy(): Promise<HealthCheckResult> {
+async function checkHealthViaProxy(): Promise<ReadinessProbeResult> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('health check timeout')), 8000)
+      timeoutId = setTimeout(() => reject(new Error('health check timeout')), 8000)
     })
     const resultPromise = invoke<string>('proxy_health_check')
     const result = await Promise.race([resultPromise, timeoutPromise])
 
     const lower = result.toLowerCase()
-    if (
-      lower.includes('healthy')
-      || lower.includes('ready')
-      || result.includes('200')
-      || result.includes('201')
-      || lower.includes('ok')
-    ) {
+    if (lower.startsWith('healthy')) {
       console.warn('[Harness] health check passed:', result.split(' - <!doctype html>')[0])
-      return { healthy: true, notOwned: false }
+      return {
+        healthy: true,
+        notOwned: false,
+        phase: 'client-modules',
+        reason: result,
+      }
     }
     console.warn('[Harness] health check returned:', result)
-    return { healthy: false, notOwned: false }
+    return {
+      healthy: false,
+      notOwned: false,
+      phase: 'client-modules',
+      reason: result,
+    }
   }
   catch (err) {
     const message = String(err)
     if (message.includes('HARNESS_NOT_OWNED')) {
       // dsh 进程已退出（典型如插件冲突导致启动即崩溃），继续等只会白白耗完
-      // 8 轮超时，让调用方立刻结束重试并展示日志里的真实错误。
+      // 当前阶段 deadline，让调用方立刻结束并展示日志里的真实错误。
       console.warn('[Harness] dsh process exited during startup, failing fast')
-      return { healthy: false, notOwned: true }
+      return {
+        healthy: false,
+        notOwned: true,
+        phase: 'process-boot',
+        reason: message,
+      }
     }
     if (message.includes('502') || message.includes('Bad Gateway')) {
       console.warn('[Harness] transient 502 during health check, retrying')
@@ -106,8 +133,49 @@ async function checkHealthViaProxy(): Promise<HealthCheckResult> {
     else {
       console.error('[Harness] health check failed:', err)
     }
-    return { healthy: false, notOwned: false }
+    return {
+      healthy: false,
+      notOwned: false,
+      phase: message.includes('client modules') || message.includes('client plugins')
+        ? 'client-modules'
+        : 'process-boot',
+      reason: message,
+    }
   }
+  finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId)
+    }
+  }
+}
+
+function startupError(phase: StartupPhase, reason: string, kind: 'failed' | 'inactivity' | 'absolute' | 'exited'): StartupError {
+  const phaseLabel = i18next.t(`startup.phase.${phase}`)
+  const message = i18next.t(`errors.startup_${kind}`, {
+    phase: phaseLabel,
+    reason,
+  })
+  const error: StartupError = new Error(message)
+  error.phase = phase
+  error.lastReason = reason
+  return error
+}
+
+function pollHarnessReadiness(
+  absoluteTimeoutMs: number,
+  shouldContinue: () => boolean,
+  onProbe?: (result: ReadinessProbeResult) => void,
+): Promise<ReadinessPollResult> {
+  return pollReadiness({
+    probe: checkHealthViaProxy,
+    intervalMs: HEALTH_PROBE_INITIAL_INTERVAL,
+    maxIntervalMs: HEALTH_PROBE_MAX_INTERVAL,
+    backoffFactor: 1.5,
+    inactivityTimeoutMs: STARTUP_INACTIVITY_TIMEOUT,
+    absoluteTimeoutMs,
+    shouldContinue,
+    onProbe,
+  })
 }
 
 /** 读取服务日志尾部（去掉 ANSI 转义与空行），启动失败时展示真实错误 */
@@ -139,6 +207,11 @@ async function attachStartupDiagnostics(err: unknown): Promise<StartupError> {
     if (lines.join('\n').includes('duplicate prefix route')) {
       startupError.pluginConflictHint = i18next.t('errors.plugin_route_conflict')
     }
+    // 识别 Linux inotify 文件监视上限（ENOSPC）：harness 服务启动即崩溃且用户无法直接解决，
+    // 需要系统级调高 fs.inotify.max_user_watches（见 errors.inotify_limit 文案）
+    if (containsInotifyLimitError(lines)) {
+      startupError.inotifyLimitHint = i18next.t('errors.inotify_limit')
+    }
   }
   return startupError as StartupError
 }
@@ -160,6 +233,8 @@ export const harness = defineStore({
     errorLogs: [] as string[],
     /** 识别到插件路由冲突时的针对性提示（Loadable children 展示） */
     pluginConflictHint: '',
+    /** 识别到 Linux inotify 文件监视上限（ENOSPC）时的针对性提示（Loadable children 展示） */
+    inotifyLimitHint: '',
     /** 插件异常修复界面状态（启动崩溃/运行期异常 → 弹出「卸除此插件并继续检测」） */
     recovery: initialRecovery,
     /** 用户已「暂不处理」的插件 id（避免同一运行期异常反复弹窗） */
@@ -185,8 +260,8 @@ export const harness = defineStore({
     iframeKey: 0,
     serviceHealthy: false,
     serviceRunning: false,
-    /** 内置插件核对/安装阶段：加载屏在「Loading internal plugins…」与「Loading plugins…」间切换 */
-    internalLoading: false,
+    startupPhase: 'plugin-install' as StartupPhase,
+    startupReason: '',
     busyAction: null as SidebarBusyAction,
   }),
   actions: {
@@ -195,9 +270,94 @@ export const harness = defineStore({
       if (bootStarted)
         return
       bootStarted = true
-      void this.listenPluginRecovery()
-      void this.listenInternalPhase()
-      void this.boot()
+      void this.initialize()
+    },
+
+    async initialize() {
+      await Promise.all([
+        this.listenPluginRecovery(),
+        this.listenInternalPhase(),
+        this.listenProcessExit(),
+      ])
+      await this.boot()
+    },
+
+    /** 订阅当前持有的 Harness 根进程退出事件，及时撤下失效 iframe。 */
+    async listenProcessExit() {
+      try {
+        await listen<HarnessProcessExitedPayload>('harness-process-exited', (event) => {
+          void this.handleProcessExit(event.payload)
+        })
+      }
+      catch (err) {
+        console.error('[Harness] failed to listen harness-process-exited:', err)
+      }
+    },
+
+    /**
+     * 处理运行期退出：先通过 ownership-aware 健康代理确认事件仍属于当前代，
+     * 避免延迟事件覆盖已重启的新进程；确认后使旧启动链失效并展示可重试错误页。
+     */
+    async handleProcessExit(payload: HarnessProcessExitedPayload) {
+      const observedToken = bootToken
+      if (!shouldAcceptRuntimeExit({
+        serviceHealthy: this.serviceHealthy,
+        serviceRunning: this.serviceRunning,
+        readinessCommitPending: readinessCommitToken === observedToken,
+        busyAction: this.busyAction,
+        observedToken,
+        currentToken: bootToken,
+        notOwned: true,
+      })) {
+        return
+      }
+
+      const probe = await checkHealthViaProxy()
+      if (!shouldAcceptRuntimeExit({
+        serviceHealthy: this.serviceHealthy,
+        serviceRunning: this.serviceRunning,
+        readinessCommitPending: readinessCommitToken === observedToken,
+        busyAction: this.busyAction,
+        observedToken,
+        currentToken: bootToken,
+        notOwned: probe.notOwned,
+      })) {
+        return
+      }
+
+      const exitToken = ++bootToken
+      const message = i18next.t(runtimeExitMessageKey(payload.exitCode), {
+        code: payload.exitCode,
+      })
+      let exitDetail = '(exit code unavailable)'
+      if (payload.exitCode != null)
+        exitDetail = `(exit code ${payload.exitCode})`
+      console.warn(
+        `[Harness] owned process ${payload.pid} exited unexpectedly`,
+        exitDetail,
+      )
+      iframeReloadGate.reset()
+      if (iframeRefreshTimer !== undefined) {
+        clearTimeout(iframeRefreshTimer)
+        iframeRefreshTimer = undefined
+      }
+      this.serviceHealthy = false
+      this.iframeLoaded = false
+      this.iframeError = false
+      this.fail(message)
+
+      const error = await attachStartupDiagnostics(new Error(message))
+      if (exitToken !== bootToken)
+        return
+      await this.reviewStartupRecovery(error.logLines ?? error.logs ?? [], exitToken)
+      if (exitToken !== bootToken)
+        return
+      this.fail(
+        error.message,
+        error.logs,
+        error.pluginConflictHint,
+        error.inotifyLimitHint,
+      )
     },
 
     /**
@@ -217,13 +377,23 @@ export const harness = defineStore({
 
     /**
      * 订阅后端「内置插件核对阶段」推送：`internal-plugins-phase` 事件
-     * （loading / done），加载屏据此在「Loading internal plugins…」与
+     * （loading / progress / done），加载屏据此在「Loading internal plugins…」与
      * 「Loading plugins…」之间切换。事件在服务启动前发出，健康轮询期间到达。
      */
     async listenInternalPhase() {
       try {
         await listen<InternalPluginsPhasePayload>('internal-plugins-phase', (event) => {
-          this.internalLoading = event.payload.phase === 'loading'
+          const payload = event.payload
+          pluginActivitySequence++
+          pluginActivityReason = internalPluginReason(
+            payload,
+            pluginActivityReason,
+            (key, options) => i18next.t(key, options),
+          )
+          if (payload.phase !== 'done') {
+            this.startupPhase = 'plugin-install'
+            this.startupReason = pluginActivityReason
+          }
         })
       }
       catch (err) {
@@ -235,7 +405,11 @@ export const harness = defineStore({
     refreshIframe() {
       this.iframeLoaded = false
       this.iframeError = false
-      setTimeout(() => {
+      if (iframeRefreshTimer !== undefined) {
+        clearTimeout(iframeRefreshTimer)
+      }
+      iframeRefreshTimer = setTimeout(() => {
+        iframeRefreshTimer = undefined
         this.iframeKey++
       }, 800)
     },
@@ -249,6 +423,44 @@ export const harness = defineStore({
     markIframeError() {
       this.iframeError = true
       this.iframeLoaded = false
+    },
+
+    markIframeBootReady() {
+      iframeReloadGate.markReady()
+      if (iframeRefreshTimer !== undefined) {
+        clearTimeout(iframeRefreshTimer)
+        iframeRefreshTimer = undefined
+      }
+    },
+
+    async recoverIframeBoot() {
+      const generation = this.iframeKey
+      const decision = iframeReloadGate.request(generation)
+      if (decision === 'duplicate' || decision === 'ready')
+        return
+      if (decision === 'exhausted') {
+        const reason = i18next.t('errors.client_boot_stalled')
+        const error = startupError('client-modules', reason, 'absolute')
+        this.fail(error.message, undefined, undefined, undefined, this.serviceRunning)
+        return
+      }
+
+      const result = await pollHarnessReadiness(
+        IFRAME_RECOVERY_ABSOLUTE_TIMEOUT,
+        () => generation === this.iframeKey && this.serviceRunning,
+      )
+      if (generation !== this.iframeKey || !this.serviceRunning)
+        return
+      if (result.healthy) {
+        this.refreshIframe()
+        return
+      }
+
+      const phase = result.phase ?? 'client-modules'
+      const reason = result.reason ?? i18next.t('errors.no_readiness_reason')
+      const kind = result.notOwned ? 'exited' : result.timeout ?? 'failed'
+      const error = startupError(phase, reason, kind)
+      this.fail(error.message, undefined, undefined, undefined, !result.notOwned)
     },
 
     /** 安装进度流：只前进不后退，供首次安装/手动更新共用 */
@@ -270,63 +482,127 @@ export const harness = defineStore({
       })
     },
 
+    /** 服务探测通过后的统一收尾；token 用于阻止旧启动流程覆盖新状态 */
+    async completeReadiness(token: number): Promise<boolean> {
+      if (token !== bootToken)
+        return false
+
+      // poll 通过与 ready 提交之间仍可能退出。进入提交窗口后再复核一次 ownership，
+      // 既能捕获窗口开启前已丢失的退出事件，也让窗口内事件用 token 中止本次提交。
+      const finalProbe = await checkHealthViaProxy()
+      if (token !== bootToken)
+        return false
+      // 上一轮 poll 已确认就绪；这里只让 ownership 丢失推翻结果，短暂探测失败不降级。
+      if (finalProbe.notOwned) {
+        this.serviceRunning = false
+        const phase = finalProbe.phase ?? this.startupPhase
+        const reason = finalProbe.reason ?? (this.startupReason || i18next.t('errors.no_readiness_reason'))
+        throw startupError(phase, reason, 'exited')
+      }
+
+      const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
+      if (token !== bootToken)
+        return false
+      // alpha 补丁无法命中的新鉴权布局仍可通过一次性 URL 完成首次挂载；IPC 取走后
+      // 远端页面不能再次读取可复用 token。
+      const launchUrl = await invoke<string | null>('take_harness_launch_url')
+      if (token !== bootToken)
+        return false
+
+      this.serviceUrl = readyInfo.service_url
+      this.iframeSrc = generateTimestampedUrl(launchUrl || readyInfo.service_url)
+      this.serviceHealthy = true
+      this.serviceRunning = true
+      this.status = 'ready'
+      this.errorMsg = ''
+      this.errorLogs = []
+      this.pluginConflictHint = ''
+      this.inotifyLimitHint = ''
+      this.preinstall.error = ''
+      // 服务（重）启动成功：清空插件异常修复态（若曾进入），并重置已「暂不处理」的插件
+      this.recovery = { required: false, info: null, attempts: 0, busy: false }
+      this.dismissedRecoveryIds = []
+      iframeReloadGate.reset()
+      if (iframeRefreshTimer !== undefined) {
+        clearTimeout(iframeRefreshTimer)
+        iframeRefreshTimer = undefined
+      }
+      // 服务（重）启动成功后，dsh 版本/端口/CLI 链接状态等运行时信息可能已变化
+      // （典型：Harness 更新后旧版本缓存仍在，调试侧边栏需刷新页面才显示新版本）。
+      // 使侧边栏相关查询缓存失效，重新打开/已挂载时自动拉取最新值。
+      void queryClient.invalidateQueries({ queryKey: ['info'] })
+      void queryClient.invalidateQueries({ queryKey: ['config'] })
+      void queryClient.invalidateQueries({ queryKey: ['cli_status'] })
+      // 档案/核心切换后重启：当前档案的插件列表、核心来源状态一并刷新
+      void queryClient.invalidateQueries({ queryKey: ['plugins'] })
+      void queryClient.invalidateQueries({ queryKey: ['profiles'] })
+      void queryClient.invalidateQueries({ queryKey: ['cores'] })
+      return true
+    },
+
     /** 拉起服务并等待健康检查通过，通过后才允许挂载 iframe */
-    async launchAndWait() {
+    async launchAndWait(token?: number) {
       this.status = 'ready'
       this.installer = initialInstaller
       this.errorMsg = ''
       this.errorLogs = []
       this.pluginConflictHint = ''
+      this.inotifyLimitHint = ''
       this.recovery = initialRecovery
       this.dismissedRecoveryIds = []
       this.serviceHealthy = false
       this.iframeLoaded = false
       this.iframeError = false
+      this.startupPhase = 'process-boot'
+      this.startupReason = i18next.t('status.loading_process')
       try {
         await invoke('launch_harness')
         this.serviceRunning = true
+        this.startupPhase = 'process-boot'
+        this.startupReason = i18next.t('status.loading_process')
         // 后端遇到端口占用时会自动递增并持久化端口，启动后重新读取真实地址。
         const runtimeInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
         this.serviceUrl = runtimeInfo.service_url
         this.iframeSrc = generateTimestampedUrl(runtimeInfo.service_url)
 
-        let healthy = false
-        let notOwned = false
-        for (let attempt = 0; attempt < MAX_RETRIES && !healthy && !notOwned; attempt++) {
-          const result = await checkHealthViaProxy()
-          healthy = result.healthy
-          notOwned = result.notOwned
-          if (!healthy && !notOwned) {
-            await new Promise(resolve => setTimeout(resolve, 2000))
-          }
+        const result = await pollHarnessReadiness(
+          STARTUP_ABSOLUTE_TIMEOUT,
+          () => token === undefined || token === bootToken,
+          (probe) => {
+            if (probe.phase) {
+              this.startupPhase = probe.phase
+            }
+            this.startupReason = probe.reason ?? ''
+          },
+        )
+        if (token !== undefined && token !== bootToken) {
+          return
         }
-        if (!healthy) {
-          throw new Error(
-            i18next.t('errors.service_start_timeout', { port: new URL(this.serviceUrl).port || '3080' }),
-          )
+        if (!result.healthy) {
+          const phase = result.phase ?? this.startupPhase
+          const reason = result.reason ?? (this.startupReason || i18next.t('errors.no_readiness_reason'))
+          if (result.notOwned) {
+            this.serviceRunning = false
+            throw startupError(phase, reason, 'exited')
+          }
+          if (result.timeout) {
+            throw startupError(phase, reason, result.timeout)
+          }
+          throw startupError(phase, reason, 'failed')
         }
         // 服务已就绪后再取一次真实地址：`launch_harness` 可能因后端已在并发拉起
         // （auto_start）而提前返回，此刻端口若尚未落库，上面读到的 service_url 会是
         // 旧端口；健康检查通过意味着服务已在最终端口就绪，此时读取必然准确。
         // 避免 iframe 挂载到一个无人监听的地址（表现为首次加载失败、刷新后恢复）。
-        const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
-        const launchUrl = await invoke<string | null>('take_harness_launch_url')
-        this.serviceUrl = readyInfo.service_url
-        this.iframeSrc = generateTimestampedUrl(launchUrl || readyInfo.service_url)
-        this.serviceHealthy = true
-        // 服务（重）启动成功：清空插件异常修复态（若曾进入），并重置已「暂不处理」的插件
-        this.recovery = { required: false, info: null, attempts: 0, busy: false }
-        this.dismissedRecoveryIds = []
-        // 服务（重）启动成功后，dsh 版本/端口/CLI 链接状态等运行时信息可能已变化
-        // （典型：Harness 更新后旧版本缓存仍在，调试侧边栏需刷新页面才显示新版本）。
-        // 使侧边栏相关查询缓存失效，重新打开/已挂载时自动拉取最新值。
-        void queryClient.invalidateQueries({ queryKey: ['info'] })
-        void queryClient.invalidateQueries({ queryKey: ['config'] })
-        void queryClient.invalidateQueries({ queryKey: ['cli_status'] })
-        // 档案/核心切换后重启：当前档案的插件列表、核心来源状态一并刷新
-        void queryClient.invalidateQueries({ queryKey: ['plugins'] })
-        void queryClient.invalidateQueries({ queryKey: ['profiles'] })
-        void queryClient.invalidateQueries({ queryKey: ['cores'] })
+        const readinessToken = token ?? bootToken
+        readinessCommitToken = readinessToken
+        try {
+          await this.completeReadiness(readinessToken)
+        }
+        finally {
+          if (readinessCommitToken === readinessToken)
+            readinessCommitToken = null
+        }
       }
       catch (err) {
         // 失败时附上服务日志里的真实错误行，供错误界面展示而不是只显示超时文案
@@ -337,6 +613,11 @@ export const harness = defineStore({
     /** 启动流程：检测环境/安装依赖 → 拉起服务 → 已安装时后台检查更新 */
     async boot() {
       const token = ++bootToken
+      iframeReloadGate.reset()
+      if (iframeRefreshTimer !== undefined) {
+        clearTimeout(iframeRefreshTimer)
+        iframeRefreshTimer = undefined
+      }
       // 回到加载态：已安装时不再显示检测/启动界面，直接进入页面加载状态
       this.serviceHealthy = false
       this.iframeLoaded = false
@@ -347,6 +628,7 @@ export const harness = defineStore({
       this.errorMsg = ''
       this.errorLogs = []
       this.pluginConflictHint = ''
+      this.inotifyLimitHint = ''
       this.recovery = { required: false, info: null, attempts: this.recovery.attempts, busy: false }
       this.status = 'ready'
       let unlistenInstall: UnlistenFn | null = null
@@ -360,7 +642,7 @@ export const harness = defineStore({
         catch (err) {
           console.error('[Harness] failed to listen install-progress:', err)
         }
-        const runtimeInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
+        const runtimeInfo = await invoke<{ service_url: string }>('get_runtime_info')
         this.serviceUrl = runtimeInfo.service_url
         this.iframeSrc = generateTimestampedUrl(runtimeInfo.service_url)
 
@@ -369,12 +651,11 @@ export const harness = defineStore({
           installed: boolean
         }>('get_app_config')
 
-        // 仅首次使用需要检测环境/安装依赖；之后直接进入页面。
-        // 桌面端自更新（MSI 强杀进程）后 store 可能被复位/损坏显示未安装，
-        // 但运行时文件已全部在盘——此时跳过安装/下载界面，install_dependencies
-        // 内部自愈补记 installed 后直接启动，避免自动重开时闪现误导用户的界面。
-        if (!config.installed) {
-          const ready = await invoke<boolean>('runtime_ready')
+        // 每次启动都做纯本地运行时检查：旧版本升级后 installed 仍为 true，但新版
+        // 可能新增依赖（如 Windows 空白环境需要的 MinGit），必须进入幂等自愈。
+        // 已全部就绪时不调用安装命令，因此不会联网，也不会闪现安装界面。
+        const ready = await invoke<boolean>('runtime_ready')
+        if (!ready || !config.installed) {
           if (!ready) {
             this.status = 'installing'
             this.installer = { ...initialInstaller, title: i18next.t('status.installing') }
@@ -382,19 +663,46 @@ export const harness = defineStore({
           await invoke('install_dependencies')
         }
 
-        // 内置插件自愈（独立于预装引导）：无论是否进入预装页、点不点「继续/跳过」，
-        // 都在启动阶段先把内置插件核对/安装到位——加载屏先显示「Loading internal
-        // plugins…」（此处乐观置位消除文案闪跳，后端 internal-plugins-phase 事件为
-        // 权威信号），确保「下一步先加载内部插件」。后端幂等且不阻断：失败仅告警。
-        this.internalLoading = true
+        // 内置插件自愈是独立、显式且有界的启动阶段。后端 heartbeat 只延长无活动
+        // deadline，绝对上限不会延长；旧启动 token 失效时立即停止采纳结果。
+        this.startupPhase = 'plugin-install'
+        this.startupReason = i18next.t('status.loading_internal')
+        pluginActivitySequence++
+        pluginActivityReason = i18next.t('status.internal_waiting')
         try {
-          await invoke('ensure_internal_plugins')
+          const result = await waitForActivityTask({
+            task: invoke('ensure_internal_plugins'),
+            getActivity: () => ({
+              sequence: pluginActivitySequence,
+              reason: pluginActivityReason,
+            }),
+            inactivityTimeoutMs: PLUGIN_INACTIVITY_TIMEOUT,
+            absoluteTimeoutMs: PLUGIN_ABSOLUTE_TIMEOUT,
+            intervalMs: PLUGIN_ACTIVITY_CHECK_INTERVAL,
+            shouldContinue: () => token === bootToken,
+          })
+          if (result.cancelled) {
+            return
+          }
+          if (result.timeout) {
+            try {
+              // 后端只在所属进程树已退出、共享 flight 已释放后返回；在此之前不
+              // 进入失败态，避免用户立即 Retry 订阅到上一轮 cancelled 结果。
+              await invoke('cancel_internal_plugins')
+            }
+            catch (cancelError) {
+              console.error('[Harness] failed to cancel timed-out internal plugin install:', cancelError)
+              throw startupError('plugin-install', String(cancelError), 'failed')
+            }
+            throw startupError('plugin-install', result.reason, result.timeout)
+          }
         }
         catch (err) {
-          console.error('[Harness] ensure internal plugins failed (best-effort):', err)
+          if (err instanceof Error && (err as StartupError).phase) {
+            throw err
+          }
+          throw startupError('plugin-install', String(err), 'failed')
         }
-        this.internalLoading = false
-
         // 预装插件引导：首次安装、老版本升级（无指纹基线）或 preset-plugins.json
         // 内容变更（社区新增推荐插件）时重新进入预设流程，装完/跳过后才拉起服务。
         // preset-plugins.json 随安装包发布、每次安装被强制覆盖，旧文件不可比对，
@@ -405,7 +713,7 @@ export const harness = defineStore({
           return
         }
 
-        await this.launchAndWait()
+        await this.launchAndWait(token)
 
         if (token !== bootToken)
           return
@@ -421,7 +729,13 @@ export const harness = defineStore({
         const startupError = await attachStartupDiagnostics(err)
         // 尝试从日志定位问题插件：能定位则弹出修复界面（全屏恢复页）
         await this.reviewStartupRecovery(startupError.logLines ?? startupError.logs ?? [])
-        this.fail(String(startupError), startupError.logs, startupError.pluginConflictHint)
+        this.fail(
+          startupError.message,
+          startupError.logs,
+          startupError.pluginConflictHint,
+          startupError.inotifyLimitHint,
+          this.serviceRunning,
+        )
       }
       finally {
         unlistenInstall?.()
@@ -435,23 +749,26 @@ export const harness = defineStore({
     },
 
     /** 进入错误态（供本模块与 updater 模块共用） */
-    fail(message: string, logs?: string[], pluginConflictHint?: string) {
+    fail(message: string, logs?: string[], pluginConflictHint?: string, inotifyLimitHint?: string, keepServiceRunning = false) {
       this.errorMsg = message
       this.errorLogs = logs ?? []
       this.pluginConflictHint = pluginConflictHint ?? ''
+      this.inotifyLimitHint = inotifyLimitHint ?? ''
       this.status = 'error'
-      this.serviceRunning = false
+      this.serviceRunning = keepServiceRunning
     },
 
     /**
      * 启动失败时尝试定位问题插件并弹出修复界面。
      * 能定位到具体插件 → 设置 `recovery`；定位不到则保持普通错误态（无插件可卸载）。
      */
-    async reviewStartupRecovery(logs: string[]) {
+    async reviewStartupRecovery(logs: string[], token?: number) {
       if (this.recovery.required || logs.length === 0)
         return
       try {
         const info = await invoke<PluginRecoveryInfo>('detect_plugin_recovery', { logs })
+        if (token !== undefined && token !== bootToken)
+          return
         if (info.plugins.length > 0) {
           this.recovery = {
             required: true,
@@ -512,28 +829,34 @@ export const harness = defineStore({
     },
 
     /** 重启服务：先强杀再拉起，最终回到就绪/错误态 */
-    async restart() {
-      if (this.busyAction)
-        return
-      this.busyAction = 'restart'
-      // 手动重启（含修复界面上的「重启 Harness」）：先退出恢复态，
-      // 若重启仍失败，boot 的 catch 会重新定位问题插件并再次弹出。
-      this.recovery = { ...this.recovery, required: false, busy: false }
-      try {
-        emitter.emit('config:dialog:hidden')
-        await invoke('shutdown_harness')
-      }
-      catch (err) {
-        console.error('[Harness] shutdown during restart failed:', err)
-      }
-      this.serviceRunning = false
-      this.iframeLoaded = false
-      try {
-        await this.boot()
-      }
-      finally {
-        this.busyAction = null
-      }
+    restart(): Promise<void> {
+      return restartFlight.run(async () => {
+        if (this.busyAction)
+          return
+        this.busyAction = 'restart'
+        // 重启旧进程前先撤下旧 iframe；这样延迟到达的旧进程退出事件不会被
+        // 误当成新一代启动失败。新进程通过 completeReadiness 后再恢复 healthy。
+        this.serviceHealthy = false
+        this.iframeLoaded = false
+        this.iframeError = false
+        // 手动重启（含修复界面上的「重启 Harness」）：先退出恢复态，
+        // 若重启仍失败，boot 的 catch 会重新定位问题插件并再次弹出。
+        this.recovery = { ...this.recovery, required: false, busy: false }
+        try {
+          emitter.emit('config:dialog:hidden')
+          await invoke('shutdown_harness')
+        }
+        catch (err) {
+          console.error('[Harness] shutdown during restart failed:', err)
+        }
+        this.serviceRunning = false
+        try {
+          await this.boot()
+        }
+        finally {
+          this.busyAction = null
+        }
+      })
     },
 
     /** 停止服务并回到停止态界面 */
@@ -557,6 +880,7 @@ export const harness = defineStore({
       this.errorMsg = i18next.t('ui.stopped')
       this.errorLogs = []
       this.pluginConflictHint = ''
+      this.inotifyLimitHint = ''
       this.recovery = initialRecovery
       this.dismissedRecoveryIds = []
     },
@@ -636,7 +960,10 @@ export const harness = defineStore({
       }
       catch (err) {
         console.error('[Harness] preinstall failed:', err)
-        this.preinstall.error = String(err)
+        const error = String(err)
+        this.preinstall.error = error.startsWith('NETWORK_ERROR:')
+          ? i18next.t('preinstall.network_error')
+          : error
       }
       finally {
         unlisten?.()

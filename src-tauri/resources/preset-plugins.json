@@ -11,33 +11,6 @@
     "winOnly": true
   },
   {
-    "id": "dsh-tauri",
-    "spec": "dsh-tauri@0.2.0",
-    "name": "DSH Tauri",
-    "internal": true,
-    "description": "Message bridge for the DeepSeek Harness desktop shell",
-    "repoUrl": "https://github.com/dsh-tauri-desk/dsh-tauri",
-    "recommended": true
-  },
-  {
-    "id": "dsh-tauri-ui",
-    "spec": "dsh-tauri-ui@0.1.0",
-    "internal": true,
-    "name": "DSH Tauri UI",
-    "description": "Customized Tauri UI plugin for the DeepSeek Harness desktop shell (skeleton): registers the shell.overlay seat for the future desktop chrome",
-    "repoUrl": "https://github.com/dsh-tauri-desk/dsh-tauri-ui",
-    "recommended": true
-  },
-  {
-    "id": "dsh-tauri-worktree",
-    "spec": "dsh-tauri-worktree@0.1.0",
-    "internal": true,
-    "name": "DSH Tauri Worktree",
-    "description": "Per-session isolated Git Worktree for the desktop shell: switch a conversation to its own isolated worktree, then check changes back into a local dsh/ branch or discard them.",
-    "repoUrl": "https://github.com/dsh-tauri-desk/dsh-tauri-worktree",
-    "recommended": true
-  },
-  {
     "id": "dshmarket",
     "spec": "dshmarket",
     "name": "DSH Market",
@@ -52,15 +25,6 @@
     "description": "A VSCode-like right sidebar (explorer / editor / terminal / git / browser), isolated per conversation session. Exposes a service for other plugins to register sidebar tabs and file viewers.",
     "repoUrl": "https://github.com/omdsh-dev/DSH-better-sidebar",
     "recommended": true
-  },
-  {
-    "id": "dsh-notification",
-    "spec": "github:omdsh-dev/dsh-notification",
-    "name": "DSH Notification",
-    "description": "Desktop notifications when a turn finishes — per-outcome toggles plus include/exclude keyword rules, delivered via the browser Notification API. ",
-    "repoUrl": "https://github.com/omdsh-dev/dsh-notification",
-    "recommended": false,
-    "defaultChecked": true
   },
   {
     "id": "dsh-session-context-menu",

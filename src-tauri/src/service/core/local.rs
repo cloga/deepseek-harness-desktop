@@ -211,13 +211,17 @@ fn local_core_uses_pnpm(app_handle: &AppHandle) -> bool {
     };
     let prefixes = prefix_candidates(&bin);
     // npm 布局命中（node_modules 包存在）→ npm 管理
-    let npm_layout = prefixes.iter().any(|p| {
-        probe_package_dir(p).is_some() || probe_package_dir(&p.join("lib")).is_some()
-    });
+    let npm_layout = prefixes
+        .iter()
+        .any(|p| probe_package_dir(p).is_some() || probe_package_dir(&p.join("lib")).is_some());
     // pnpm 布局：`<prefix>/global/<n>/node_modules/@deepseek-ai/dsh` 命中 → pnpm 管理
     let pnpm_layout = prefixes.iter().any(|p| {
         std::fs::read_dir(p.join("global"))
-            .map(|entries| entries.flatten().any(|e| probe_package_dir(&e.path()).is_some()))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| probe_package_dir(&e.path()).is_some())
+            })
             .unwrap_or(false)
     });
     !npm_layout && pnpm_layout
@@ -238,12 +242,20 @@ pub async fn update_local_core(app_handle: AppHandle) -> Result<String, String> 
     let (pm, args): (&str, Vec<String>) = if uses_pnpm {
         (
             "pnpm",
-            vec!["add".to_string(), "-g".to_string(), "@deepseek-ai/dsh@latest".to_string()],
+            vec![
+                "add".to_string(),
+                "-g".to_string(),
+                "@deepseek-ai/dsh@latest".to_string(),
+            ],
         )
     } else {
         (
             "npm",
-            vec!["install".to_string(), "-g".to_string(), "@deepseek-ai/dsh@latest".to_string()],
+            vec![
+                "install".to_string(),
+                "-g".to_string(),
+                "@deepseek-ai/dsh@latest".to_string(),
+            ],
         )
     };
     log::info!("Updating local dsh core via `{pm} {args:?}`");
@@ -318,10 +330,7 @@ mod tests {
             r#"{"name":"@deepseek-ai/dsh","version":"0.1.0-rc.8"}"#,
         )
         .unwrap();
-        assert_eq!(
-            read_package_version(&dir).as_deref(),
-            Some("0.1.0-rc.8")
-        );
+        assert_eq!(read_package_version(&dir).as_deref(), Some("0.1.0-rc.8"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -351,7 +360,11 @@ mod tests {
     fn write_our_shim(dir: &std::path::Path) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let p = dir.join("dsh");
-        std::fs::write(&p, "# DeepSeek Harness Desktop - dsh command shim (generated)\n").unwrap();
+        std::fs::write(
+            &p,
+            "# DeepSeek Harness Desktop - dsh command shim (generated)\n",
+        )
+        .unwrap();
         p
     }
 
@@ -361,10 +374,7 @@ mod tests {
     fn scan_dir_finds_foreign_dsh_inside_shim_dir() {
         let dir = temp_dir("foreign-in-shim");
         let dsh = write_foreign_dsh(&dir);
-        assert_eq!(
-            scan_dirs_for_user_dsh(&[dir.clone()], &["dsh"]),
-            Some(dsh)
-        );
+        assert_eq!(scan_dirs_for_user_dsh(&[dir.clone()], &["dsh"]), Some(dsh));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -428,7 +438,12 @@ mod tests {
         // npm 布局命中 `~/.local` 前缀下的 `<prefix>/lib/node_modules/...`
         assert_eq!(
             package_dir_from_bin(&bin),
-            Some(root.join("lib").join("node_modules").join("@deepseek-ai").join("dsh"))
+            Some(
+                root.join("lib")
+                    .join("node_modules")
+                    .join("@deepseek-ai")
+                    .join("dsh")
+            )
         );
         let _ = std::fs::remove_dir_all(&root);
     }

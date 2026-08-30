@@ -12,6 +12,7 @@
 use crate::config;
 use crate::service::fs_guard;
 use serde::Serialize;
+use serde_yaml::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::AppHandle;
@@ -28,7 +29,8 @@ const WEB_PROFILE_BUNDLES: [&str; 2] = ["@deepseek-ai/dsh-base", "@deepseek-ai/d
 const PROFILE_PATCH_TEMPLATE: &str = "# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; `!!js` expressions allowed).\n[]\n";
 
 /// dsh `initProfile` 生成的 pnpm 设置（与官方一致）
-const PROFILE_PNPM_WORKSPACE: &str = "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n";
+const PROFILE_PNPM_WORKSPACE: &str =
+    "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n\n# The desktop runtime intentionally reviews this fresh transitive release.\nminimumReleaseAgeExclude:\n  - zod@4.4.3\n";
 
 /// 档案行（序列化 camelCase 给前端）
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +53,55 @@ pub fn profile_dir_of(app_handle: &AppHandle, id: &str) -> PathBuf {
         .join(id)
 }
 
+/// pnpm 11 的最小发布时间策略会在 registry 元数据短暂不可用时把已审查的
+/// lockfile 条目误判为违规。zod 是当前 Harness runtime closure 中的已审查条目，
+/// 仅豁免 lockfile 使用的精确版本，避免关闭整个 supply-chain policy。
+const PROFILE_MINIMUM_RELEASE_AGE_EXCLUDES: [&str; 1] = ["zod@4.4.3"];
+
+pub(crate) fn ensure_profile_pnpm_policy(app_handle: &AppHandle) -> Result<(), String> {
+    let path = profile_dir_of(app_handle, &active_profile(app_handle)).join("pnpm-workspace.yaml");
+    let existing = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            PROFILE_PNPM_WORKSPACE.to_string()
+        }
+        Err(error) => return Err(format!("PROFILE_WORKSPACE_READ: {error}")),
+    };
+    let mut document: Value = serde_yaml::from_str(&existing)
+        .map_err(|e| format!("PROFILE_WORKSPACE_INVALID_YAML: {e}"))?;
+    let mapping = document.as_mapping_mut().ok_or_else(|| {
+        "PROFILE_WORKSPACE_NOT_MAP: pnpm-workspace.yaml must be a mapping".to_string()
+    })?;
+    let key = Value::String("minimumReleaseAgeExclude".to_string());
+    let excludes = mapping
+        .entry(key)
+        .or_insert_with(|| Value::Sequence(Vec::new()));
+    let sequence = excludes.as_sequence_mut().ok_or_else(|| {
+        "PROFILE_WORKSPACE_POLICY_INVALID: minimumReleaseAgeExclude must be a sequence".to_string()
+    })?;
+    let mut changed = false;
+    for package in PROFILE_MINIMUM_RELEASE_AGE_EXCLUDES {
+        let value = Value::String(package.to_string());
+        if !sequence.iter().any(|item| item == &value) {
+            sequence.push(value);
+            changed = true;
+        }
+    }
+    if changed {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("PROFILE_WORKSPACE_MKDIR: {e}"))?;
+        }
+        let rendered = serde_yaml::to_string(&document)
+            .map_err(|e| format!("PROFILE_WORKSPACE_RENDER: {e}"))?;
+        fs::write(&path, rendered).map_err(|e| format!("PROFILE_WORKSPACE_WRITE: {e}"))?;
+        log::info!(
+            "Ensured profile pnpm release-age policy: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// 当前使用的档案 id。
 ///
 /// 读取桌面端持久化的 `active_profile`；若记录的档案目录已不存在（被删除/外部
@@ -58,7 +109,9 @@ pub fn profile_dir_of(app_handle: &AppHandle, id: &str) -> PathBuf {
 /// （web 由 dsh 启动/插件操作时按需初始化）。
 pub fn active_profile(app_handle: &AppHandle) -> String {
     let stored = config::get_store_dat_setting(app_handle).active_profile;
-    if !stored.is_empty() && stored != DEFAULT_PROFILE && profile_dir_of(app_handle, &stored).is_dir()
+    if !stored.is_empty()
+        && stored != DEFAULT_PROFILE
+        && profile_dir_of(app_handle, &stored).is_dir()
     {
         stored
     } else {
@@ -79,7 +132,11 @@ fn manifest_display_name(dir: &Path, id: &str) -> String {
         .map(String::from)
         .unwrap_or_else(|| raw);
     let fallback = id.to_string();
-    let name = if stripped.is_empty() { fallback } else { stripped };
+    let name = if stripped.is_empty() {
+        fallback
+    } else {
+        stripped
+    };
     // 首字母大写，与既有「Web」展示风格一致
     let mut chars = name.chars();
     match chars.next() {
@@ -197,10 +254,14 @@ pub fn set_active(app_handle: &AppHandle, id: &str) -> Result<Profile, String> {
 /// 删除档案（默认档案与使用中的档案不可删除）。
 pub fn remove(app_handle: &AppHandle, id: &str) -> Result<(), String> {
     if id == DEFAULT_PROFILE {
-        return Err("PROFILE_DEFAULT_NOT_REMOVABLE: the default profile cannot be removed".to_string());
+        return Err(
+            "PROFILE_DEFAULT_NOT_REMOVABLE: the default profile cannot be removed".to_string(),
+        );
     }
     if id == active_profile(app_handle) {
-        return Err("PROFILE_ACTIVE_NOT_REMOVABLE: the active profile cannot be removed".to_string());
+        return Err(
+            "PROFILE_ACTIVE_NOT_REMOVABLE: the active profile cannot be removed".to_string(),
+        );
     }
     // 路径安全：ID 字符集白名单 + 目标必须位于 profiles 根目录内（防 `..` 穿越）
     let profiles_root = config::get_dsh_data_path(app_handle).join("profiles");
@@ -246,7 +307,10 @@ fn init_profile_dir(dir: &Path, id: &str) -> Result<(), String> {
     // 与 ensure_profile_npmrc 一致地预写 .npmrc（幂等，绝不覆盖已有配置）。
     let npmrc_path = dir.join(".npmrc");
     let npmrc_existing = fs::read_to_string(&npmrc_path).unwrap_or_default();
-    if !npmrc_existing.lines().any(|l| l.trim() == "confirmModulesPurge=false") {
+    if !npmrc_existing
+        .lines()
+        .any(|l| l.trim() == "confirmModulesPurge=false")
+    {
         let mut content = npmrc_existing;
         if !content.is_empty() && !content.ends_with('\n') {
             content.push('\n');

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, WebviewWindow};
 
@@ -33,37 +34,166 @@ pub struct PreinstallLogPayload {
 /// `cancel`（跨平台）用它结束安装进程树；安装结束/失败后必须复位，
 /// 防止把「下一个安装」或无关进程误杀。
 ///
-/// 仅在 Unix 被 `cancel` 使用（Windows 取消安装走 taskkill 按命令行匹配），
-/// 故 Windows 下按项目约定允许 dead_code。
-#[cfg_attr(windows, allow(dead_code))]
-static ACTIVE_PLUGIN_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ProcessOwner(u64);
 
-#[cfg_attr(windows, allow(dead_code))]
-fn active_pid_lock() -> &'static Mutex<Option<u32>> {
-    ACTIVE_PLUGIN_PID.get_or_init(|| Mutex::new(None))
+static NEXT_PROCESS_OWNER: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_PLUGIN_PIDS: OnceLock<Mutex<HashMap<ProcessOwner, u32>>> = OnceLock::new();
+static PLUGIN_PROCESS_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+static PLUGIN_OPERATION_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+static PLUGIN_CLEANUP_FAILURE: OnceLock<
+    tokio::sync::watch::Sender<Option<(ProcessOwner, String)>>,
+> = OnceLock::new();
+
+fn active_pid_lock() -> &'static Mutex<HashMap<ProcessOwner, u32>> {
+    ACTIVE_PLUGIN_PIDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 当前进行中安装的根进程 PID（取消安装用）。
-#[cfg_attr(windows, allow(dead_code))]
-pub(crate) fn active_plugin_pid() -> Option<u32> {
-    *active_pid_lock().lock().unwrap_or_else(|e| e.into_inner())
+fn cleanup_failure_sender() -> &'static tokio::sync::watch::Sender<Option<(ProcessOwner, String)>> {
+    PLUGIN_CLEANUP_FAILURE.get_or_init(|| tokio::sync::watch::channel(None).0)
 }
 
-/// 记录/清除当前安装进程 PID（guard-drop 模式，作用域结束自动复位）。
-#[cfg_attr(windows, allow(dead_code))]
-struct PidGuard;
+pub(crate) fn new_process_owner() -> ProcessOwner {
+    ProcessOwner(NEXT_PROCESS_OWNER.fetch_add(1, Ordering::Relaxed))
+}
 
-#[cfg_attr(windows, allow(dead_code))]
-impl PidGuard {
-    fn set(pid: u32) {
-        *active_pid_lock().lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
+pub(crate) fn active_plugin_pid(owner: ProcessOwner) -> Option<u32> {
+    active_pid_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&owner)
+        .copied()
+}
+
+pub(crate) fn active_plugin_processes() -> Vec<(ProcessOwner, u32)> {
+    active_pid_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(owner, pid)| (*owner, *pid))
+        .collect()
+}
+
+#[cfg(windows)]
+pub(crate) fn plugin_process_has_exited(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(87);
+    }
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    wait == 0
+}
+
+#[cfg(not(windows))]
+pub(crate) fn plugin_process_has_exited(pid: u32) -> bool {
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    if waited == pid as libc::pid_t {
+        return true;
+    }
+    if waited == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+pub(crate) fn mark_process_cleanup_failed(owner: ProcessOwner, reason: String) {
+    cleanup_failure_sender().send_replace(Some((owner, reason)));
+}
+
+pub(crate) fn clear_process_cleanup_failed(owner: ProcessOwner) {
+    cleanup_failure_sender().send_if_modified(|failure| {
+        if failure.as_ref().is_some_and(|(active, _)| *active == owner) {
+            *failure = None;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+pub(crate) fn release_process_cleanup(
+    owner: ProcessOwner,
+    pid_guard: PidGuard,
+    process_guard: tokio::sync::OwnedMutexGuard<()>,
+) {
+    clear_process_cleanup_failed(owner);
+    drop(pid_guard);
+    drop(process_guard);
+}
+
+pub(crate) async fn acquire_process_lock() -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let lock = PLUGIN_PROCESS_LOCK
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let mut cleanup_failure = cleanup_failure_sender().subscribe();
+    loop {
+        if let Some((_, reason)) = cleanup_failure.borrow().as_ref() {
+            return Err(reason.clone());
+        }
+        tokio::select! {
+            guard = lock.clone().lock_owned() => {
+                if let Some((_, reason)) = cleanup_failure.borrow().as_ref() {
+                    drop(guard);
+                    return Err(reason.clone());
+                }
+                return Ok(guard);
+            }
+            changed = cleanup_failure.changed() => {
+                if changed.is_err() {
+                    return Err(
+                        "PLUGIN_PROCESS_COORDINATOR_DROPPED: cleanup coordinator ended unexpectedly"
+                            .to_string(),
+                    );
+                }
+            }
+        }
     }
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+pub(crate) async fn acquire_operation_lock() -> tokio::sync::OwnedMutexGuard<()> {
+    PLUGIN_OPERATION_LOCK
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await
+}
+
+/// 记录/清除当前安装进程 PID（guard-drop 模式，作用域结束自动复位）。
+pub(crate) struct PidGuard {
+    owner: ProcessOwner,
+    pid: u32,
+}
+
+impl PidGuard {
+    pub(crate) fn set(owner: ProcessOwner, pid: u32) -> Self {
+        active_pid_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(owner, pid);
+        Self { owner, pid }
+    }
+}
+
 impl Drop for PidGuard {
     fn drop(&mut self) {
-        *active_pid_lock().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let mut active = active_pid_lock().lock().unwrap_or_else(|e| e.into_inner());
+        if active.get(&self.owner) == Some(&self.pid) {
+            active.remove(&self.owner);
+        }
     }
 }
 
@@ -88,20 +218,26 @@ pub(crate) async fn run_plugin_process(
     cwd: &Path,
     envs: &HashMap<String, String>,
     window: &WebviewWindow,
+    owner: ProcessOwner,
 ) -> Result<(i32, String), String> {
+    let process_guard = acquire_process_lock().await?;
     let captured = Arc::new(Mutex::new(String::new()));
 
     #[cfg(windows)]
     {
-        let (stdout, stderr, handle) =
-            workflow::win_spawn::spawn_with_hidden_console_tracked(node, args, Some(cwd), envs)
+        let (stdout, stderr, pid, handle) =
+            workflow::win_spawn::spawn_with_hidden_console_owned(node, args, Some(cwd), envs)
                 .map_err(|e| format!("PREINSTALL_SPAWN: {e}"))?;
+        let pid_guard = PidGuard::set(owner, pid);
+        log::info!("dsh plugin install started, pid {pid}");
 
         spawn_line_emitter(stdout, window.clone(), captured.clone());
         spawn_line_emitter(stderr, window.clone(), captured.clone());
 
         let handle = WaitableHandle(handle);
         let exit_code = tauri::async_runtime::spawn_blocking(move || {
+            let _process_guard = process_guard;
+            let _pid_guard = pid_guard;
             use windows_sys::Win32::Foundation::CloseHandle;
             use windows_sys::Win32::System::Threading::{
                 GetExitCodeProcess, WaitForSingleObject, INFINITE,
@@ -140,11 +276,10 @@ pub(crate) async fn run_plugin_process(
             .map_err(|e| format!("PREINSTALL_SPAWN: {e}"))?;
 
         let pid = child.id();
-        PidGuard::set(pid);
+        let pid_guard = PidGuard::set(owner, pid);
         // 绑定守卫实例：本 cfg 块作用域结束时自动把共享 PID 槽复位为 None，
         // 避免把「这一次安装」的 PID 泄漏给之后的取消/下一次安装（误杀无关进程）。
         // 若 spawn_blocking 因错误提前 `?` 返回，守卫同样会 Drop 复位。
-        let _pid_guard = PidGuard;
         log::info!("dsh plugin install started, pid {pid}");
 
         if let Some(stdout) = child.stdout.take() {
@@ -155,6 +290,8 @@ pub(crate) async fn run_plugin_process(
         }
 
         let exit_code = tauri::async_runtime::spawn_blocking(move || {
+            let _process_guard = process_guard;
+            let _pid_guard = pid_guard;
             child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
         })
         .await
@@ -182,19 +319,102 @@ fn spawn_line_emitter<R: Read + Send + 'static>(
     captured: Arc<Mutex<String>>,
 ) {
     std::thread::spawn(move || {
-        let buf = BufReader::new(reader);
-        for line in buf.lines().map_while(Result::ok) {
-            let trimmed = line.trim_end().to_string();
-            let _ = window.emit(
-                PREINSTALL_LOG_EVENT,
-                PreinstallLogPayload {
-                    line: trimmed.clone(),
-                },
-            );
-            if let Ok(mut acc) = captured.lock() {
-                acc.push_str(&trimmed);
-                acc.push('\n');
+        let mut buf = BufReader::new(reader);
+        let mut acc_buf = Vec::new();
+        loop {
+            acc_buf.clear();
+            match buf.read_until(b'\n', &mut acc_buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    // lossy 兜底：zh-CN Windows 下 python MCP 插件输出 GBK 日志时，
+                    // 严格 UTF-8 读取会中断本线程并关闭子进程管道（EPIPE）——
+                    // 安装进程可能因此以非 0 退出码失败，被误判为安装失败。
+                    // 行尾剥离与上游 utils.rs 的 #197 修复一致：只剥 \r\n/\n，
+                    // 保留行内尾随空白以对齐 BufRead::lines() 语义。
+                    let line = String::from_utf8_lossy(&acc_buf);
+                    let trimmed = line
+                        .strip_suffix("\r\n")
+                        .or_else(|| line.strip_suffix('\n'))
+                        .unwrap_or(&line)
+                        .to_string();
+                    let _ = window.emit(
+                        PREINSTALL_LOG_EVENT,
+                        PreinstallLogPayload {
+                            line: trimmed.clone(),
+                        },
+                    );
+                    if let Ok(mut acc) = captured.lock() {
+                        acc.push_str(&trimmed);
+                        acc.push('\n');
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to read plugin process output: {}", e);
+                    break;
+                }
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_guard_cannot_clear_a_new_process_for_the_same_owner() {
+        let owner = new_process_owner();
+        let stale = PidGuard::set(owner, 100);
+        let current = PidGuard::set(owner, 200);
+
+        drop(stale);
+        assert_eq!(active_plugin_pid(owner), Some(200));
+
+        drop(current);
+        assert_eq!(active_plugin_pid(owner), None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_clears_before_lock_handoff_and_preserves_other_owner() {
+        let guard = acquire_process_lock().await.unwrap();
+        let owner = new_process_owner();
+        let pid_guard = PidGuard::set(owner, 100);
+        let reason = "PLUGIN_PROCESS_CLEANUP_FAILED: test process is still active".to_string();
+        mark_process_cleanup_failed(owner, reason.clone());
+
+        let waiter = tokio::spawn(acquire_process_lock());
+        tokio::task::yield_now().await;
+        assert!(
+            waiter.is_finished(),
+            "active cleanup failure should wake a queued waiter"
+        );
+        assert_eq!(waiter.await.unwrap().unwrap_err(), reason);
+
+        clear_process_cleanup_failed(owner);
+        let handoff = tokio::spawn(acquire_process_lock());
+        tokio::task::yield_now().await;
+        assert!(
+            !handoff.is_finished(),
+            "waiter should queue after failure clears while guard remains held"
+        );
+        drop(pid_guard);
+        drop(guard);
+        assert!(handoff.await.unwrap().is_ok());
+        assert_eq!(active_plugin_pid(owner), None);
+
+        let guard = acquire_process_lock().await.unwrap();
+        let other_owner = new_process_owner();
+        let stale_pid_guard = PidGuard::set(owner, 101);
+        let other_reason =
+            "PLUGIN_PROCESS_CLEANUP_FAILED: another owner is still active".to_string();
+        mark_process_cleanup_failed(other_owner, other_reason.clone());
+        release_process_cleanup(owner, stale_pid_guard, guard);
+
+        assert_eq!(
+            acquire_process_lock().await.unwrap_err(),
+            other_reason,
+            "clearing a stale owner must not remove another owner's failure"
+        );
+        clear_process_cleanup_failed(other_owner);
+    }
 }

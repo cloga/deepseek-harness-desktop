@@ -6,6 +6,7 @@
 
 use crate::config;
 use crate::logger;
+use crate::service::core;
 use tauri::AppHandle;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
@@ -22,11 +23,9 @@ pub async fn proxy_health_check(app_handle: AppHandle) -> Result<String, String>
 pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeInfo, String> {
     let port = config::get_store_dat_setting(&app_handle).port;
     let mut info = config::runtime_info(&app_handle, port);
-    info.dsh_version = crate::service::core::active_version(&app_handle);
-    info.core_source = crate::service::core::active_source(&app_handle)
-        .as_str()
-        .to_string();
-    info.core_path = crate::service::core::active_dsh_binary(&app_handle)
+    info.dsh_version = core::active_version(&app_handle).or(info.dsh_version);
+    info.core_source = core::active_source(&app_handle).as_str().to_string();
+    info.core_path = core::active_dsh_binary(&app_handle)
         .ok()
         .map(|path| path.to_string_lossy().into_owned());
     Ok(info)
@@ -69,8 +68,7 @@ pub fn reveal_in_folder(app_handle: AppHandle, path: String) -> Result<(), Strin
     if !crate::bridge::guard::is_allowed_path(&app_handle, std::path::Path::new(&path)) {
         return Err(format!("REVEAL_PATH_REJECTED: {path}"));
     }
-    tauri_plugin_opener::reveal_item_in_dir(&path)
-        .map_err(|e| format!("REVEAL_FAILED: {e}"))
+    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|e| format!("REVEAL_FAILED: {e}"))
 }
 
 /// 在系统文件管理器中打开指定目录（核心版本「打开目录」按钮；目录用 open 而非
@@ -81,8 +79,7 @@ pub fn open_dir(app_handle: AppHandle, path: String) -> Result<(), String> {
     if !crate::bridge::guard::is_allowed_path(&app_handle, std::path::Path::new(&path)) {
         return Err(format!("OPEN_DIR_REJECTED: {path}"));
     }
-    tauri_plugin_opener::open_path(&path, None::<&str>)
-        .map_err(|e| format!("OPEN_DIR_FAILED: {e}"))
+    tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| format!("OPEN_DIR_FAILED: {e}"))
 }
 
 /// 在系统文件管理器中打开数据目录（官方 $DSH_HOME，即 ~/.dsh）
@@ -212,11 +209,12 @@ pub async fn read_run_logs(app_handle: AppHandle) -> Result<String, String> {
     };
 
     // 环境信息：桌面端应用版本、dsh 发行版本、Node 版本与系统平台/架构，便于报障时快速定位环境差异
-    let dsh_version = crate::service::core::active_version(&app_handle)
+    let dsh_version = core::active_version(&app_handle)
+        .or_else(|| config::get_dsh_version(&app_handle))
         .map(|v| format!("dsh: {v}\n"))
         .unwrap_or_default();
-    let core_source = crate::service::core::active_source(&app_handle).as_str();
-    let core_path = crate::service::core::active_dsh_binary(&app_handle)
+    let core_source = core::active_source(&app_handle).as_str();
+    let core_path = core::active_dsh_binary(&app_handle)
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -276,24 +274,40 @@ mod tests {
     #[test]
     fn frontend_line_detected() {
         // tracing 文件层（desktop.log）与前端独立文件（desktop.frontdesk.log）两种时间戳格式都应命中
-        assert!(is_frontend_log_line("2024-06-01 12:00:00.123Z INFO frontend: [tag] message"));
-        assert!(is_frontend_log_line("[2024-06-01 12:00:00.123Z] INFO frontend: message"));
-        assert!(is_frontend_log_line("2024-06-01 12:00:00.123Z WARN frontend: something"));
-        assert!(is_frontend_log_line("2024-06-01 12:00:00.123Z ERROR frontend: boom"));
+        assert!(is_frontend_log_line(
+            "2024-06-01 12:00:00.123Z INFO frontend: [tag] message"
+        ));
+        assert!(is_frontend_log_line(
+            "[2024-06-01 12:00:00.123Z] INFO frontend: message"
+        ));
+        assert!(is_frontend_log_line(
+            "2024-06-01 12:00:00.123Z WARN frontend: something"
+        ));
+        assert!(is_frontend_log_line(
+            "2024-06-01 12:00:00.123Z ERROR frontend: boom"
+        ));
     }
 
     #[test]
     fn backend_line_not_detected() {
         // 后端（dsh 等 target）不应误判为前端；消息正文里出现 "frontend" 也不应命中
-        assert!(!is_frontend_log_line("2024-06-01 12:00:00.123Z INFO dsh: starting server"));
-        assert!(!is_frontend_log_line("[2024-06-01 12:00:00.123Z] INFO dsh: emit to frontend: 3"));
-        assert!(!is_frontend_log_line("2024-06-01 12:00:00.123Z DEBUG reqwest: GET /ping"));
+        assert!(!is_frontend_log_line(
+            "2024-06-01 12:00:00.123Z INFO dsh: starting server"
+        ));
+        assert!(!is_frontend_log_line(
+            "[2024-06-01 12:00:00.123Z] INFO dsh: emit to frontend: 3"
+        ));
+        assert!(!is_frontend_log_line(
+            "2024-06-01 12:00:00.123Z DEBUG reqwest: GET /ping"
+        ));
     }
 
     #[test]
     fn frontend_level_padding_and_extra_spaces() {
         // 级别可能带前导空格（`{:>5}` 或 tracing 层多空格），frontend 目标仍应命中
-        assert!(is_frontend_log_line("2024-06-01 12:00:00.123Z  INFO frontend: padded"));
+        assert!(is_frontend_log_line(
+            "2024-06-01 12:00:00.123Z  INFO frontend: padded"
+        ));
     }
 
     #[test]
