@@ -164,7 +164,7 @@
   "core.refresh": "Refresh",
   "core.refreshed_toast": "Core list refreshed",
   "core.refresh_failed": "Failed to refresh the core list",
-  "core.tooltip": "Harness Core is the dsh engine powering the desktop. Manage local copies of each version here — switch the running version, or uninstall ones you no longer need.",
+  "core.tooltip": "Harness Core is the dsh engine powering the desktop. Local uses a globally installed CLI; Bundled versions come from deepseek-harness-pkg releases. A src-* version is a source-built remote pre-release, not a local checkout.",
   "core.local": "Local",
   "core.uninstall": "Uninstall",
   "core.not_downloaded": "not downloaded",

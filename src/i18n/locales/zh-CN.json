@@ -164,7 +164,7 @@
   "core.refresh": "刷新",
   "core.refreshed_toast": "核心列表已刷新",
   "core.refresh_failed": "刷新核心列表失败",
-  "core.tooltip": "Harness Core 是驱动桌面端的 dsh 引擎。这里管理各版本的本地副本：切换到指定版本运行，或卸载不再需要的版本。",
+  "core.tooltip": "Harness Core 是驱动桌面端的 dsh 引擎。本地核心来自全局安装的 CLI；预打包核心来自 deepseek-harness-pkg 发行版。src-* 表示远端源码构建的预览发行版，不是本机 checkout。",
   "core.local": "本地",
   "core.uninstall": "卸载",
   "core.not_downloaded": "未下载",

@@ -25,7 +25,9 @@ use super::status;
 use super::sweep::persist_harness_pid;
 #[cfg(windows)]
 use super::sweep::{dsh_bin_open_error, relaunch_marker_path, relaunch_via_shell_escape};
-use super::utils::{is_port_in_use, rotate_service_log, spawn_output_readers};
+use super::utils::{
+    clear_harness_launch_url, is_port_in_use, rotate_service_log, spawn_output_readers,
+};
 use super::win_inspector;
 
 /// 端口释放等待上限：刚结束/清扫过上个会话的残留 dsh 进程后，TCP 端口释放
@@ -452,12 +454,17 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")))
         .map_err(|e| format!("LOG_DIR_MKDIR_FAILED: create log dir failed: {e}"))?;
     rotate_service_log(&log_path, 3);
+    clear_harness_launch_url();
 
     // rc.8 起 `dsh web` 默认在系统浏览器打开 UI；桌面端内嵌 WebView，不需要
     // 浏览器，追加 `--no-open` 关闭（老版本无此标志时按版本判定不传）。
     let no_open = web_supports_no_open_flag(&app_handle, &dsh_binary_path);
 
-    log::info!("Starting Harness process");
+    log::info!(
+        "Starting Harness process: source={}, entry={}",
+        crate::service::core::active_source(&app_handle).as_str(),
+        dsh_binary_path.display()
+    );
 
     // Windows 打包版是 GUI 进程（没有控制台）。直接以 CREATE_NO_WINDOW 启动
     // node 会让 dsh 派生的子进程各自新建可见控制台窗口（频繁闪烁 cmd 黑窗），

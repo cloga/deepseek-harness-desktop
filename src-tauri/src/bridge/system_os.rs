@@ -24,13 +24,20 @@ pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeIn
     let port = config::get_store_dat_setting(&app_handle).port;
     let mut info = config::runtime_info(&app_handle, port);
     info.dsh_version = core::active_version(&app_handle).or(info.dsh_version);
+    info.launch_url = crate::service::workflow::utils::harness_launch_url(port);
+    info.core_source = core::active_source(&app_handle).as_str().to_string();
+    info.core_path = core::active_dsh_binary(&app_handle)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
     Ok(info)
 }
 
 /// 在系统浏览器中打开 Harness 界面
 #[tauri::command]
 pub async fn open_in_browser(app_handle: AppHandle) -> Result<(), String> {
-    let url = config::get_dsh_service_url(config::get_store_dat_setting(&app_handle).port);
+    let port = config::get_store_dat_setting(&app_handle).port;
+    let url = crate::service::workflow::utils::harness_launch_url(port)
+        .unwrap_or_else(|| config::get_dsh_service_url(port));
     app_handle
         .opener()
         .open_url(url, None::<&str>)

@@ -49,6 +49,11 @@ fn safe_slot_path(deps: &Path, tag: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// 预打包目录内实际传给 Node.js 的 dsh 入口。
+fn app_binary_path(dir: &Path) -> PathBuf {
+    dir.join(config::DSH_ENTRY_RELATIVE)
+}
+
 /// 读取发行版目录 `package.json` 中 `@deepseek-ai/dsh` 依赖版本（历史槽位展示用）。
 fn read_manifest_dsh_version(dir: &Path) -> Option<String> {
     let content = std::fs::read_to_string(dir.join("package.json")).ok()?;
@@ -288,7 +293,7 @@ pub async fn list(app_handle: &AppHandle) -> Vec<HarnessCore> {
                 source: CoreSource::App,
                 version: version.clone(),
                 tag: tag.clone(),
-                path: dir.to_string_lossy().into_owned(),
+                path: app_binary_path(&dir).to_string_lossy().into_owned(),
                 dir: dir.to_string_lossy().into_owned(),
                 present: true,
                 active: false,

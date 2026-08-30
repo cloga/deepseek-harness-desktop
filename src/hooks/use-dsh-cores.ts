@@ -15,7 +15,7 @@ export interface HarnessCore {
   version: string
   /** 完整 release tag（如 `dsh-0.1.0-rc.8-32331963388`；local 行为空串） */
   tag: string
-  /** 核心入口（cli path）：本地核心为 bin.js，预打包为安装目录 */
+  /** 实际传给 Node.js 的 bin.js 绝对路径；本地 link 已解析到真实目标 */
   path: string
   /** 「打开目录」入口：本地核心为包目录，预打包为安装/槽位目录；未下载为空 */
   dir: string

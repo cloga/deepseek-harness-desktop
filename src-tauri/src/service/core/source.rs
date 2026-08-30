@@ -50,7 +50,7 @@ pub struct HarnessCore {
     pub version: String,
     /// 完整 release tag（如 `dsh-0.1.0-rc.8-32331963388`；local 行为空串）
     pub tag: String,
-    /// 核心入口（cli path）：本地核心为 bin.js 绝对路径，预打包为安装目录
+    /// 核心入口（cli path）：实际传给 Node.js 的 bin.js 绝对路径
     pub path: String,
     /// 「打开目录」入口：本地核心为包目录，预打包为安装/槽位目录；未下载为空
     pub dir: String,

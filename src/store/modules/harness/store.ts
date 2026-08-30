@@ -75,13 +75,21 @@ const restartFlight = new SingleFlight<void>()
 const iframeReloadGate = new BoundedReloadGate(3)
 let iframeRefreshTimer: ReturnType<typeof setTimeout> | undefined
 
-/** 构建带时间戳的 iframe URL，避免 WebView2 缓存旧页面。
- * alpha 鉴权由启动前的桌面端 patch 处理，iframe 永远不携带启动 token；旧核心
- * 同样继续使用原有的缓存查询参数。 */
+/** 构建带时间戳的 iframe URL，避免 WebView2 缓存旧页面。 */
 function generateTimestampedUrl(baseUrl: string): string {
   const timestamp = Date.now()
   const separator = baseUrl.includes('?') ? '&' : '?'
   return `${baseUrl}${separator}t=${timestamp}`
+}
+
+interface HarnessRuntimeInfo {
+  service_url: string
+  launch_url?: string | null
+}
+
+/** 认证核心优先使用一次性 launch URL；旧核心继续使用普通服务地址。 */
+function runtimeIframeUrl(info: HarnessRuntimeInfo): string {
+  return info.launch_url || info.service_url
 }
 
 /** 通过 Rust 代理探测服务健康状态（超时 8s，网络抖动时重试） */
@@ -498,12 +506,12 @@ export const harness = defineStore({
         throw startupError(phase, reason, 'exited')
       }
 
-      const readyInfo = await invoke<{ service_url: string }>('get_runtime_info')
+      const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
       if (token !== bootToken)
         return false
 
       this.serviceUrl = readyInfo.service_url
-      this.iframeSrc = generateTimestampedUrl(readyInfo.service_url)
+      this.iframeSrc = generateTimestampedUrl(runtimeIframeUrl(readyInfo))
       this.serviceHealthy = true
       this.serviceRunning = true
       this.status = 'ready'
