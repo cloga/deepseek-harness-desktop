@@ -319,9 +319,9 @@ pub async fn check_dsh_update(
 
 /// 启动 Harness 服务
 #[tauri::command]
-pub async fn launch_harness(app_handle: AppHandle, generation: u64) -> Result<(), String> {
-    workflow::utils::set_harness_launch_generation(generation);
-    finish_harness_launch(workflow::launch(app_handle).await)
+pub async fn launch_harness(app_handle: AppHandle) -> Result<u64, String> {
+    let generation = workflow::utils::begin_harness_launch_generation();
+    finish_harness_launch(workflow::launch(app_handle).await).map(|()| generation)
 }
 
 /// 启动失败时清除已重标的旧 URL，避免前置检查错误留下可取用的过期凭据。

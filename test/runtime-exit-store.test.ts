@@ -95,7 +95,7 @@ describe('runtime exit store', () => {
 
     invoke.mockImplementation(async (command: string) => {
       if (command === 'launch_harness')
-        return undefined
+        return 1
       if (command === 'get_runtime_info') {
         runtimeInfoReads++
         if (runtimeInfoReads === 1)
@@ -133,7 +133,7 @@ describe('runtime exit store', () => {
     let healthChecks = 0
     invoke.mockImplementation(async (command: string) => {
       if (command === 'launch_harness')
-        return undefined
+        return 2
       if (command === 'get_runtime_info')
         return { service_url: 'http://127.0.0.1:31415' }
       if (command === 'take_harness_launch_url')
@@ -156,7 +156,7 @@ describe('runtime exit store', () => {
     let healthChecks = 0
     invoke.mockImplementation(async (command: string) => {
       if (command === 'launch_harness')
-        return undefined
+        return 3
       if (command === 'get_runtime_info')
         return { service_url: 'http://127.0.0.1:31415' }
       if (command === 'proxy_health_check') {

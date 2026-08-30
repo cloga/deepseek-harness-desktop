@@ -10,7 +10,7 @@ const DSH_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const DSH_MAX_BACKUPS: usize = 3;
 static DSH_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static PENDING_HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<(u64, String)>>> = OnceLock::new();
+static PENDING_HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static HARNESS_LAUNCH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn dsh_log_lock() -> &'static Mutex<()> {
@@ -21,23 +21,13 @@ fn harness_launch_url_slot() -> &'static Mutex<Option<String>> {
     HARNESS_LAUNCH_URL.get_or_init(|| Mutex::new(None))
 }
 
-fn pending_harness_launch_url_slot() -> &'static Mutex<Option<(u64, String)>> {
+fn pending_harness_launch_url_slot() -> &'static Mutex<Option<String>> {
     PENDING_HARNESS_LAUNCH_URL.get_or_init(|| Mutex::new(None))
 }
 
-/// 把前端单调递增的启动代绑定到随后捕获的认证 URL，阻止旧启动流程取走新 URL。
-pub fn set_harness_launch_generation(generation: u64) {
-    let previous = HARNESS_LAUNCH_GENERATION.fetch_max(generation, Ordering::SeqCst);
-    if generation < previous {
-        return;
-    }
-    if let Some((pending_generation, _)) = pending_harness_launch_url_slot()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_mut()
-    {
-        *pending_generation = generation;
-    }
+/// 为一次宿主启动分配进程内单调递增的代号，阻止旧启动流程取走新 URL。
+pub fn begin_harness_launch_generation() -> u64 {
+    HARNESS_LAUNCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 /// 清除上一进程的认证 URL，防止核心重启后复用已经失效的 token。
@@ -63,18 +53,18 @@ pub fn harness_launch_url(port: u16) -> Option<String> {
 
 /// 仅向首次挂载的 WebView 交付一次认证 URL。
 pub fn take_harness_launch_url(port: u16, generation: u64) -> Option<String> {
+    if HARNESS_LAUNCH_GENERATION.load(Ordering::SeqCst) != generation {
+        return None;
+    }
     let mut pending = pending_harness_launch_url_slot()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let (pending_generation, value) = pending.as_ref()?;
-    if *pending_generation != generation {
-        return None;
-    }
+    let value = pending.as_ref()?;
     let parsed = reqwest::Url::parse(&value).ok()?;
     if parsed.host_str() != Some("127.0.0.1") || parsed.port_or_known_default() != Some(port) {
         return None;
     }
-    pending.take().map(|(_, value)| value)
+    pending.take()
 }
 
 /// 捕获 dsh 公布的一次性浏览器认证 URL，并返回适合写日志的脱敏文本。
@@ -106,10 +96,7 @@ fn capture_and_redact_launch_url(line: &str) -> String {
         .unwrap_or_else(|error| error.into_inner()) = Some(candidate.to_string());
     *pending_harness_launch_url_slot()
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some((
-        HARNESS_LAUNCH_GENERATION.load(Ordering::SeqCst),
-        candidate.to_string(),
-    ));
+        .unwrap_or_else(|error| error.into_inner()) = Some(candidate.to_string());
     let mut safe_url = parsed;
     safe_url
         .query_pairs_mut()
@@ -614,7 +601,7 @@ mod tests {
     fn authenticated_launch_url_is_captured_redacted_and_taken_once() {
         let _guard = launch_url_test_guard();
         clear_harness_launch_url();
-        let generation = HARNESS_LAUNCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = begin_harness_launch_generation();
         let safe =
             capture_and_redact_launch_url("dsh web: http://127.0.0.1:3083/?token=secret-value");
         assert_eq!(safe, "dsh web: http://127.0.0.1:3083/?token=%3Credacted%3E");
@@ -635,7 +622,7 @@ mod tests {
     fn wrong_port_or_generation_does_not_consume_launch_url() {
         let _guard = launch_url_test_guard();
         clear_harness_launch_url();
-        let generation = HARNESS_LAUNCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = begin_harness_launch_generation();
         capture_and_redact_launch_url("dsh web: http://127.0.0.1:3083/?token=secret");
         assert_eq!(take_harness_launch_url(3084, generation), None);
         assert_eq!(
@@ -643,6 +630,13 @@ mod tests {
             None
         );
         assert!(take_harness_launch_url(3083, generation).is_some());
+    }
+
+    #[test]
+    fn launch_generation_is_owned_by_the_rust_process() {
+        let first = begin_harness_launch_generation();
+        let second = begin_harness_launch_generation();
+        assert!(second > first);
     }
 
     #[test]

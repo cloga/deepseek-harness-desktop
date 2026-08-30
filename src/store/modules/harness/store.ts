@@ -483,7 +483,7 @@ export const harness = defineStore({
     },
 
     /** 服务探测通过后的统一收尾；token 用于阻止旧启动流程覆盖新状态 */
-    async completeReadiness(token: number): Promise<boolean> {
+    async completeReadiness(token: number, launchGeneration: number): Promise<boolean> {
       if (token !== bootToken)
         return false
 
@@ -501,7 +501,7 @@ export const harness = defineStore({
       }
 
       const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
-      const launchUrl = await invoke<string | null>('take_harness_launch_url', { generation: token })
+      const launchUrl = await invoke<string | null>('take_harness_launch_url', { generation: launchGeneration })
       if (token !== bootToken)
         return false
 
@@ -538,7 +538,6 @@ export const harness = defineStore({
 
     /** 拉起服务并等待健康检查通过，通过后才允许挂载 iframe */
     async launchAndWait(token?: number) {
-      const launchGeneration = token ?? bootToken
       this.status = 'ready'
       this.installer = initialInstaller
       this.errorMsg = ''
@@ -553,7 +552,7 @@ export const harness = defineStore({
       this.startupPhase = 'process-boot'
       this.startupReason = i18next.t('status.loading_process')
       try {
-        await invoke('launch_harness', { generation: launchGeneration })
+        const launchGeneration = await invoke<number>('launch_harness')
         this.serviceRunning = true
         this.startupPhase = 'process-boot'
         this.startupReason = i18next.t('status.loading_process')
@@ -594,7 +593,7 @@ export const harness = defineStore({
         const readinessToken = token ?? bootToken
         readinessCommitToken = readinessToken
         try {
-          await this.completeReadiness(readinessToken)
+          await this.completeReadiness(readinessToken, launchGeneration)
         }
         finally {
           if (readinessCommitToken === readinessToken)
