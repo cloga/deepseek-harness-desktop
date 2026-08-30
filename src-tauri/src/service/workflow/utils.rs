@@ -111,8 +111,10 @@ fn capture_and_redact_launch_url(line: &str) -> String {
         candidate.to_string(),
     ));
     let mut safe_url = parsed;
-    safe_url.query_pairs_mut().clear().extend_pairs(
-        token_pairs.iter().map(|(name, value)| {
+    safe_url
+        .query_pairs_mut()
+        .clear()
+        .extend_pairs(token_pairs.iter().map(|(name, value)| {
             (
                 name.as_str(),
                 if name == "token" {
@@ -121,8 +123,7 @@ fn capture_and_redact_launch_url(line: &str) -> String {
                     value.as_str()
                 },
             )
-        }),
-    );
+        }));
     line.replacen(candidate, safe_url.as_str(), 1)
 }
 
@@ -614,13 +615,9 @@ mod tests {
         let _guard = launch_url_test_guard();
         clear_harness_launch_url();
         let generation = HARNESS_LAUNCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-        let safe = capture_and_redact_launch_url(
-            "dsh web: http://127.0.0.1:3083/?token=secret-value",
-        );
-        assert_eq!(
-            safe,
-            "dsh web: http://127.0.0.1:3083/?token=%3Credacted%3E"
-        );
+        let safe =
+            capture_and_redact_launch_url("dsh web: http://127.0.0.1:3083/?token=secret-value");
+        assert_eq!(safe, "dsh web: http://127.0.0.1:3083/?token=%3Credacted%3E");
         assert_eq!(
             harness_launch_url(3083).as_deref(),
             Some("http://127.0.0.1:3083/?token=secret-value")

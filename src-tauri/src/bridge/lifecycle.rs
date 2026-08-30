@@ -247,8 +247,13 @@ pub async fn check_dsh_update(
 
     // 当前运行的是预览版时不提示稳定/RC 更新：预览版可能高于当前 release，
     // 但不能把用户主动选择的 alpha/beta 版本降级成较旧的 rc。
-    if config::get_store_dat_setting(&app_handle).active_core.as_deref() == Some("app")
-        && config::get_dsh_pkg_tag(&app_handle).as_deref().is_some_and(download::is_preview_tag)
+    if config::get_store_dat_setting(&app_handle)
+        .active_core
+        .as_deref()
+        == Some("app")
+        && config::get_dsh_pkg_tag(&app_handle)
+            .as_deref()
+            .is_some_and(download::is_preview_tag)
     {
         log::info!("Suppressing dsh update because a preview core is active");
         return Ok(None);
