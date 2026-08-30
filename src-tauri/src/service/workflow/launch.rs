@@ -245,7 +245,9 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<u64, String> {
         .is_err()
     {
         log::info!("Harness launch already in progress, skipping");
-        return Ok(());
+        return current_harness_launch_generation().ok_or_else(|| {
+            "HARNESS_LAUNCH_IN_PROGRESS: launch guard is held before owner registration".into()
+        });
     }
     let _launch_guard = LaunchGuard;
     // 只有持有启动守卫的这条路径清扫残留：并发启动的其它调用已在守卫处返回，
