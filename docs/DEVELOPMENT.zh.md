@@ -40,3 +40,23 @@ macOS 的 Developer ID 签名、公证与 GitHub Actions Secrets 配置见 [macO
 ## 小贴士
 
 - 调试模式使用 **3081** 端口，正式版使用 **3080** —— 两者互不冲突，可以同时运行已安装版本与开发构建。
+
+## 使用本地 dsh 构建
+
+桌面端的**本地**核心是指通过 npm/pnpm 全局安装的 `@deepseek-ai/dsh`，不是预打包列表中的最新一行。以 `src-` 开头的预打包版本，是 `deepseek-harness-pkg` 在对应版本尚未发布到 npm 时，根据上游 GitHub release tag 远端构建的预览发行版；它与本机 checkout 没有关系。
+
+推荐使用显式、可回滚的开发配置：
+
+```powershell
+cd C:\path\to\deepseek-harness\apps\cli
+npm link --ignore-scripts --no-audit --no-fund
+[Environment]::SetEnvironmentVariable(
+  'DSH_CLI_PATH',
+  (Join-Path (npm prefix -g) 'dsh.cmd'),
+  'User'
+)
+```
+
+修改全局 link 或环境变量后，需要完整退出并重新打开桌面端。选择**本地**行，并确认界面展示的“入口”已解析到 checkout。每次创建新的 Harness 进程时，桌面端日志会记录选中的 `source` 与准确 `entry`。已有会话会缓存工具 schema；验证核心改动时必须新建会话。
+
+若要移除显式覆盖，执行 `[Environment]::SetEnvironmentVariable('DSH_CLI_PATH', $null, 'User')`。该配置不会修改 `$DSH_HOME`、档案、会话或凭据。

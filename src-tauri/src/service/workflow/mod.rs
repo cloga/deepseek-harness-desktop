@@ -843,12 +843,17 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")))
         .map_err(|e| format!("create log dir failed: {e}"))?;
     utils::rotate_service_log(&log_path, 3);
+    utils::clear_harness_launch_url();
 
     // rc.8 起 `dsh web` 默认在系统浏览器打开 UI；桌面端内嵌 WebView，不需要
     // 浏览器，追加 `--no-open` 关闭（老版本无此标志时按版本判定不传）。
     let no_open = web_supports_no_open_flag(&app_handle);
 
-    log::info!("Starting Harness process");
+    log::info!(
+        "Starting Harness process: source={}, entry={}",
+        crate::service::core::active_source(&app_handle).as_str(),
+        dsh_binary_path.display()
+    );
 
     // Windows 打包版是 GUI 进程（没有控制台）。直接以 CREATE_NO_WINDOW 启动
     // node 会让 dsh 派生的子进程各自新建可见控制台窗口（频繁闪烁 cmd 黑窗），
@@ -1227,6 +1232,31 @@ fn not_owned_probe_signal(launch_in_progress: bool) -> &'static str {
 pub async fn proxy_health_check(port: u16) -> Result<String, String> {
     if !has_owned_process() {
         return Err(not_owned_probe_signal(LAUNCH_GUARD.load(Ordering::SeqCst)).to_string());
+    }
+    // 新核心在 Loader 完成后才打印一次性认证 URL；捕获到它比匿名探测插件
+    // bundle 更强，且避免匿名请求因 401 被误判为“服务尚未启动”。
+    if let Some(url) = utils::harness_launch_url(port) {
+        match client.get(url).send().await {
+            Ok(response)
+                if response.status().is_success()
+                    || response.status().is_redirection()
+                    || response.status() == reqwest::StatusCode::UNAUTHORIZED =>
+            {
+                return Ok(format!(
+                    "healthy - authenticated launch URL reachable - {}",
+                    response.status()
+                ));
+            }
+            Ok(response) => {
+                log::debug!(
+                    "Authenticated Harness readiness probe returned {}",
+                    response.status()
+                );
+            }
+            Err(error) => {
+                log::debug!("Authenticated Harness readiness probe failed: {error}");
+            }
+        }
     }
     let client = utils::loopback_http_client(config::HEALTH_CHECK_TIMEOUT)
         .map_err(|e| format!("HARNESS_HEALTH_CLIENT_FAILED: {e}"))?;

@@ -8,8 +8,58 @@ use std::time::Duration;
 const DSH_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const DSH_MAX_BACKUPS: usize = 3;
 static DSH_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static HARNESS_LAUNCH_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
 fn dsh_log_lock() -> &'static Mutex<()> {
     DSH_LOG_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn harness_launch_url_slot() -> &'static Mutex<Option<String>> {
+    HARNESS_LAUNCH_URL.get_or_init(|| Mutex::new(None))
+}
+
+/// 清除上一进程的认证 URL，防止核心重启后复用已经失效的 token。
+pub fn clear_harness_launch_url() {
+    *harness_launch_url_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+/// 返回当前进程为指定端口公布的认证 URL。
+pub fn harness_launch_url(port: u16) -> Option<String> {
+    let value = harness_launch_url_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()?;
+    let parsed = reqwest::Url::parse(&value).ok()?;
+    (parsed.host_str() == Some("127.0.0.1") && parsed.port_or_known_default() == Some(port))
+        .then_some(value)
+}
+
+/// 捕获 dsh 公布的一次性浏览器认证 URL，并返回适合写日志的脱敏文本。
+fn capture_and_redact_launch_url(line: &str) -> String {
+    let Some(candidate) = line
+        .strip_prefix("dsh web: ")
+        .and_then(|rest| rest.split_whitespace().next())
+    else {
+        return line.to_string();
+    };
+    let Ok(parsed) = reqwest::Url::parse(candidate) else {
+        return line.to_string();
+    };
+    let token = parsed
+        .query_pairs()
+        .find_map(|(name, value)| (name == "token").then(|| value.into_owned()));
+    let Some(token) = token.filter(|value| !value.is_empty()) else {
+        return line.to_string();
+    };
+    if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
+        return line.to_string();
+    }
+    *harness_launch_url_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(candidate.to_string());
+    line.replace(&token, "<redacted>")
 }
 
 /// 构造仅用于回环地址探测的 HTTP 客户端。
@@ -69,6 +119,19 @@ pub async fn is_dsh_running(port: u16) -> bool {
         None => return false,
     };
 
+    if let Some(url) = harness_launch_url(port) {
+        return client
+            .get(url)
+            .send()
+            .await
+            .map(|response| {
+                response.status().is_success()
+                    || response.status().is_redirection()
+                    || response.status() == reqwest::StatusCode::UNAUTHORIZED
+            })
+            .unwrap_or(false);
+    }
+
     let url = format!("{}/", crate::config::get_dsh_service_url(port));
 
     // 发送请求并判断是否就绪
@@ -109,8 +172,9 @@ where
             for line in reader.lines() {
                 match line {
                     Ok(line) => {
-                        log::info!(target: "dsh", "{}", line);
-                        append_log(&log_path, &line);
+                        let safe_line = capture_and_redact_launch_url(&line);
+                        log::info!(target: "dsh", "{}", safe_line);
+                        append_log(&log_path, &safe_line);
                     }
                     Err(e) => {
                         log::error!("Failed to read dsh stdout: {}", e);
@@ -128,8 +192,9 @@ where
             for line in reader.lines() {
                 match line {
                     Ok(line) => {
-                        log::warn!(target: "dsh", "{}", line);
-                        append_log(&log_path, &line);
+                        let safe_line = capture_and_redact_launch_url(&line);
+                        log::warn!(target: "dsh", "{}", safe_line);
+                        append_log(&log_path, &safe_line);
                     }
                     Err(e) => {
                         log::error!("Failed to read dsh stderr: {}", e);
@@ -285,6 +350,32 @@ mod tests {
             true,
             "window.__ModuleLoader__.load({id:\"@deepseek-ai/dsh-client-ui-layout\"})"
         ));
+    }
+
+    #[test]
+    fn authenticated_launch_url_is_captured_and_redacted() {
+        clear_harness_launch_url();
+        let safe = capture_and_redact_launch_url(
+            "dsh web: http://127.0.0.1:3083/?token=secret-value",
+        );
+        assert_eq!(
+            safe,
+            "dsh web: http://127.0.0.1:3083/?token=<redacted>"
+        );
+        assert_eq!(
+            harness_launch_url(3083).as_deref(),
+            Some("http://127.0.0.1:3083/?token=secret-value")
+        );
+        assert_eq!(harness_launch_url(3080), None);
+        clear_harness_launch_url();
+    }
+
+    #[test]
+    fn unrelated_urls_are_not_treated_as_harness_credentials() {
+        clear_harness_launch_url();
+        let line = "dsh web: https://example.com/?token=secret-value";
+        assert_eq!(capture_and_redact_launch_url(line), line);
+        assert_eq!(harness_launch_url(443), None);
     }
 
     /// keep=0 时把当前日志也删掉。

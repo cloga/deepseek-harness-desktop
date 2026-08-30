@@ -21,13 +21,24 @@ pub async fn proxy_health_check(app_handle: AppHandle) -> Result<String, String>
 #[tauri::command]
 pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeInfo, String> {
     let port = config::get_store_dat_setting(&app_handle).port;
-    Ok(config::runtime_info(&app_handle, port))
+    let mut info = config::runtime_info(&app_handle, port);
+    info.launch_url = crate::service::workflow::utils::harness_launch_url(port);
+    info.dsh_version = crate::service::core::active_version(&app_handle);
+    info.core_source = crate::service::core::active_source(&app_handle)
+        .as_str()
+        .to_string();
+    info.core_path = crate::service::core::active_dsh_binary(&app_handle)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    Ok(info)
 }
 
 /// 在系统浏览器中打开 Harness 界面
 #[tauri::command]
 pub async fn open_in_browser(app_handle: AppHandle) -> Result<(), String> {
-    let url = config::get_dsh_service_url(config::get_store_dat_setting(&app_handle).port);
+    let port = config::get_store_dat_setting(&app_handle).port;
+    let url = crate::service::workflow::utils::harness_launch_url(port)
+        .unwrap_or_else(|| config::get_dsh_service_url(port));
     app_handle
         .opener()
         .open_url(url, None::<&str>)
@@ -195,13 +206,20 @@ pub async fn read_run_logs(app_handle: AppHandle) -> Result<String, String> {
     };
 
     // 环境信息：桌面端应用版本、dsh 发行版本、Node 版本与系统平台/架构，便于报障时快速定位环境差异
-    let dsh_version = config::get_dsh_version(&app_handle)
+    let dsh_version = crate::service::core::active_version(&app_handle)
         .map(|v| format!("dsh: {v}\n"))
         .unwrap_or_default();
+    let core_source = crate::service::core::active_source(&app_handle).as_str();
+    let core_path = crate::service::core::active_dsh_binary(&app_handle)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let env_text = format!(
-        "app: {}\n{}node: {}\nos: {} ({})",
+        "app: {}\n{}core-source: {}\ncore-entry: {}\nnode: {}\nos: {} ({})",
         app_handle.package_info().version,
         dsh_version,
+        core_source,
+        core_path,
         config::get_active_node_version(),
         std::env::consts::OS,
         std::env::consts::ARCH,
