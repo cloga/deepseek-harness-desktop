@@ -321,7 +321,22 @@ pub async fn check_dsh_update(
 #[tauri::command]
 pub async fn launch_harness(app_handle: AppHandle, generation: u64) -> Result<(), String> {
     workflow::utils::set_harness_launch_generation(generation);
-    workflow::launch(app_handle).await
+    finish_harness_launch(workflow::launch(app_handle).await)
+}
+
+/// 启动失败时清除已重标的旧 URL，避免前置检查错误留下可取用的过期凭据。
+fn finish_harness_launch(result: Result<(), String>) -> Result<(), String> {
+    finish_harness_launch_with(result, workflow::utils::clear_harness_launch_url)
+}
+
+fn finish_harness_launch_with(
+    result: Result<(), String>,
+    clear_launch_url: impl FnOnce(),
+) -> Result<(), String> {
+    if result.is_err() {
+        clear_launch_url();
+    }
+    result
 }
 
 /// 停止 Harness 服务
@@ -359,7 +374,8 @@ pub fn runtime_ready(app_handle: AppHandle) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::install_lock;
+    use super::{finish_harness_launch_with, install_lock};
+    use std::cell::Cell;
 
     #[test]
     fn install_lock_is_exclusive_while_held() {
@@ -372,5 +388,27 @@ mod tests {
         // 释放后可重新获取
         drop(guard);
         assert!(lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn node_precondition_failure_clears_pending_launch_url() {
+        let pending = Cell::new(true);
+        let result = finish_harness_launch_with(
+            Err("NODE_NOT_FOUND: Node.js not installed".to_string()),
+            || pending.set(false),
+        );
+        assert!(result.is_err());
+        assert!(!pending.get());
+    }
+
+    #[test]
+    fn harness_precondition_failure_clears_pending_launch_url() {
+        let pending = Cell::new(true);
+        let result = finish_harness_launch_with(
+            Err("HARNESS_NOT_FOUND: Harness not installed".to_string()),
+            || pending.set(false),
+        );
+        assert!(result.is_err());
+        assert!(!pending.get());
     }
 }
