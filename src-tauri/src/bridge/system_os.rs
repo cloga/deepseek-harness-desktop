@@ -25,9 +25,11 @@ pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeIn
     let mut info = config::runtime_info(&app_handle, port);
     info.dsh_version = core::active_version(&app_handle).or(info.dsh_version);
     info.core_source = core::active_source(&app_handle).as_str().to_string();
-    info.core_path = core::active_dsh_binary(&app_handle)
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned());
+    info.core_path = Some(
+        core::active_dsh_binary(&app_handle)
+            .to_string_lossy()
+            .into_owned(),
+    );
     Ok(info)
 }
 
