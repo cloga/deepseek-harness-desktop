@@ -12,6 +12,46 @@ use tauri::AppHandle;
 use super::local::local_core;
 use crate::service::download::parse_version_from_tag;
 
+/// 从 pnpm monorepo 的已知 workspace 层级中按 manifest 名定位包。
+///
+/// `pnpm link --global` 会把 `@deepseek-ai/dsh` 解析到 `apps/cli`，其兄弟包并不在
+/// `node_modules`，而在仓库的 `packages/*/*`。这里只在包含 `pnpm-workspace.yaml`
+/// 的祖先内扫描固定深度，避免把普通安装目录扩大成递归搜索。
+fn resolve_workspace_package_dir(root: &Path, package: &str) -> Option<PathBuf> {
+    let workspace = root
+        .ancestors()
+        .find(|ancestor| ancestor.join("pnpm-workspace.yaml").is_file())?;
+    let expected_name = format!("@deepseek-ai/{package}");
+    for relative_root in ["packages", "apps", "vendor"] {
+        let Ok(first_level) = std::fs::read_dir(workspace.join(relative_root)) else {
+            continue;
+        };
+        for first in first_level.flatten() {
+            let first_path = first.path();
+            if package_manifest_name(&first_path).as_deref() == Some(expected_name.as_str()) {
+                return Some(first_path);
+            }
+            let Ok(second_level) = std::fs::read_dir(&first_path) else {
+                continue;
+            };
+            for second in second_level.flatten() {
+                let second_path = second.path();
+                if package_manifest_name(&second_path).as_deref() == Some(expected_name.as_str()) {
+                    return Some(second_path);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 读取候选 workspace 包的 npm 名称；非目录或无效 manifest 均视为不匹配。
+fn package_manifest_name(dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let manifest = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    manifest.get("name")?.as_str().map(String::from)
+}
+
 /// 核心来源
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -111,10 +151,11 @@ pub fn active_dsh_binary(app_handle: &AppHandle) -> Result<PathBuf, String> {
 
 /// 从核心包或安装前缀解析同一核心树内的 `@deepseek-ai/<package>`。
 ///
-/// 支持三种布局：
+/// 支持四种布局：
 /// - 预打包前缀：`<root>/node_modules/@deepseek-ai/<package>`；
 /// - 包内嵌套：`<dsh>/node_modules/@deepseek-ai/<package>`；
 /// - npm 扁平全局：`<prefix>/node_modules/@deepseek-ai/{dsh,<package>}`。
+/// - pnpm workspace link：从仓库的固定 workspace 层级按 package.json 名定位。
 pub(crate) fn resolve_core_package_dir(root: &Path, package: &str) -> Option<PathBuf> {
     let nested = root.join("node_modules").join("@deepseek-ai").join(package);
     if nested.join("package.json").is_file() {
@@ -134,7 +175,7 @@ pub(crate) fn resolve_core_package_dir(root: &Path, package: &str) -> Option<Pat
         }
     }
 
-    None
+    resolve_workspace_package_dir(root, package)
 }
 
 /// 解析活动核心树内的包；本地来源解析失败时不回退到桌面端预打包目录。
@@ -264,5 +305,33 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(packaged);
         let _ = std::fs::remove_dir_all(unrelated);
+    }
+
+    #[test]
+    fn resolves_package_from_linked_pnpm_workspace() {
+        let root = temp_dir("workspace");
+        let cli = root.join("apps").join("cli");
+        let persistence = root
+            .join("packages")
+            .join("session")
+            .join("session-persistence-jsonl");
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::create_dir_all(&persistence).unwrap();
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*/*\n",
+        )
+        .unwrap();
+        std::fs::write(
+            persistence.join("package.json"),
+            r#"{"name":"@deepseek-ai/dsh-session-persistence-jsonl"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_core_package_dir(&cli, "dsh-session-persistence-jsonl"),
+            Some(persistence)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
