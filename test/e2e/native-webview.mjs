@@ -87,6 +87,7 @@ async function main() {
     await waitFor(async () => {
       const log = await readFile(desktopLog, 'utf8')
       return log.includes('Starting Harness process:')
+        && log.includes('[harness-webview] auth relay request accepted')
         && log.includes('[harness-webview] protected probe completed: status=200')
         && log.includes('E2E fixture protected request authenticated=true')
         && log.includes('E2E fixture authenticated root document')
