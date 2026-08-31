@@ -42,10 +42,8 @@ fn request_status(port: u16, path: &str) -> u16 {
 }
 
 fn main() -> wry::Result<()> {
-    let shell = TcpListener::bind("127.0.0.1:0").expect("bind shell");
     let relay = TcpListener::bind("127.0.0.1:0").expect("bind relay");
     let core = TcpListener::bind("127.0.0.1:0").expect("bind core");
-    let shell_port = shell.local_addr().expect("shell address").port();
     let relay_port = relay.local_addr().expect("relay address").port();
     let core_port = core.local_addr().expect("core address").port();
     let authenticated = Arc::new(AtomicBool::new(false));
@@ -59,7 +57,14 @@ fn main() -> wry::Result<()> {
                 line.to_ascii_lowercase()
                     .starts_with("cookie: dsh-auth-probe=signed")
             });
-            if request.starts_with("POST /api/settings/describe ") {
+            if request.starts_with("GET /?token=one-shot ") {
+                respond(
+                    &mut stream,
+                    "303 See Other",
+                    "Location: /\r\nSet-Cookie: dsh-auth-probe=signed; Path=/; HttpOnly; SameSite=Strict\r\nCache-Control: no-store\r\n",
+                    "",
+                );
+            } else if request.starts_with("POST /api/settings/describe ") {
                 if has_cookie {
                     respond(
                         &mut stream,
@@ -93,18 +98,10 @@ fn main() -> wry::Result<()> {
             &mut stream,
             "303 See Other",
             &format!(
-                "Location: http://localhost:{core_port}/\r\nSet-Cookie: dsh-auth-probe=signed; Path=/; HttpOnly; SameSite=None; Secure\r\nCache-Control: no-store\r\n"
+                "Location: http://localhost:{core_port}/?token=one-shot\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n"
             ),
             "",
         );
-    });
-
-    std::thread::spawn(move || {
-        let (mut stream, _) = shell.accept().expect("shell request");
-        let _ = read_request(&mut stream);
-        let body =
-            format!("<!doctype html><iframe src=\"http://localhost:{relay_port}/auth\"></iframe>");
-        respond(&mut stream, "200 OK", "Content-Type: text/html\r\n", &body);
     });
 
     let event_loop = EventLoop::new();
@@ -112,7 +109,20 @@ fn main() -> wry::Result<()> {
         .with_visible(false)
         .build(&event_loop)
         .expect("build window");
-    let builder = WebViewBuilder::new().with_url(format!("http://127.0.0.1:{shell_port}/"));
+    let builder = WebViewBuilder::new()
+        .with_custom_protocol("tauri".into(), move |_webview_id, _request| {
+            wry::http::Response::builder()
+                .header(wry::http::header::CONTENT_TYPE, "text/html")
+                .body(
+                    format!(
+                        "<!doctype html><iframe src=\"http://localhost:{relay_port}/auth\"></iframe>"
+                    )
+                    .into_bytes(),
+                )
+                .expect("custom protocol response")
+                .map(Into::into)
+        })
+        .with_url("tauri://localhost");
     #[cfg(target_os = "macos")]
     let _webview = builder.build(&window)?;
     #[cfg(target_os = "linux")]

@@ -34,7 +34,7 @@ pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeIn
     Ok(info)
 }
 
-/// 用一次性 token 换取 HttpOnly Cookie 并注入宿主 WebView，token 不跨 IPC。
+/// 为 WebView 创建原生认证导航，token 不跨 IPC。
 #[derive(Serialize)]
 pub struct HarnessWebviewPreparation {
     url: String,
@@ -72,12 +72,12 @@ pub async fn prepare_harness_webview(
 async fn prepare_claimed_harness_webview(
     claim: &crate::service::workflow::utils::HarnessLaunchClaim,
 ) -> Result<HarnessWebviewPreparation, String> {
-    let (cookie, iframe_url) = exchange_harness_cookie(claim.url()).await?;
+    let (launch_url, iframe_url) = prepare_harness_launch_urls(claim.url())?;
     let probe_origin = reqwest::Url::parse(&iframe_url)
         .map_err(|_| "HARNESS_AUTH_URL_INVALID: clean iframe URL is invalid".to_string())?
         .origin()
         .ascii_serialization();
-    let relay_url = start_harness_cookie_relay(cookie, iframe_url, claim.id()).await?;
+    let relay_url = start_harness_auth_relay(launch_url, claim.id()).await?;
     Ok(HarnessWebviewPreparation {
         url: relay_url,
         verify_auth: true,
@@ -86,66 +86,33 @@ async fn prepare_claimed_harness_webview(
     })
 }
 
-/// 向核心提交一次性 token，仅接受 303 + HttpOnly Cookie 的完整交换结果。
-async fn exchange_harness_cookie(launch_url: &str) -> Result<(String, String), String> {
+/// 将受信的 127.0.0.1 启动地址规范为 WebView 使用的 localhost 地址。
+fn prepare_harness_launch_urls(launch_url: &str) -> Result<(String, String), String> {
     let mut exchange_url = reqwest::Url::parse(launch_url)
         .map_err(|error| format!("HARNESS_AUTH_URL_INVALID: {error}"))?;
-    if exchange_url.scheme() != "http" || exchange_url.host_str() != Some("127.0.0.1") {
+    let has_token = exchange_url
+        .query_pairs()
+        .any(|(name, value)| name == "token" && !value.is_empty());
+    if exchange_url.scheme() != "http"
+        || exchange_url.host_str() != Some("127.0.0.1")
+        || !exchange_url.username().is_empty()
+        || exchange_url.password().is_some()
+        || !has_token
+    {
         return Err("HARNESS_AUTH_URL_REJECTED: expected 127.0.0.1 loopback URL".into());
     }
     exchange_url
         .set_host(Some("localhost"))
         .map_err(|error| format!("HARNESS_AUTH_HOST_INVALID: {error}"))?;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(config::HEALTH_CHECK_TIMEOUT)
-        .build()
-        .map_err(|error| format!("HARNESS_AUTH_CLIENT_FAILED: {error}"))?;
-    let response = client
-        .get(exchange_url.clone())
-        .send()
-        .await
-        .map_err(|_| "HARNESS_AUTH_EXCHANGE_FAILED: loopback request failed".to_string())?;
-    if response.status() != reqwest::StatusCode::SEE_OTHER {
-        return Err(format!(
-            "HARNESS_AUTH_EXCHANGE_REJECTED: expected 303, got {}",
-            response.status()
-        ));
-    }
-    if response
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|value| value.to_str().ok())
-        != Some("/")
-    {
-        return Err("HARNESS_AUTH_REDIRECT_INVALID: expected clean root redirect".into());
-    }
-    let set_cookie = response
-        .headers()
-        .get(reqwest::header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| "HARNESS_AUTH_COOKIE_MISSING: token exchange omitted cookie".to_string())?;
-    let mut cookie = tauri::webview::Cookie::parse(set_cookie.to_string())
-        .map_err(|error| format!("HARNESS_AUTH_COOKIE_INVALID: {error}"))?
-        .into_owned();
-    if cookie.http_only() != Some(true) {
-        return Err("HARNESS_AUTH_COOKIE_INSECURE: expected HttpOnly cookie".into());
-    }
-    // Web UI lives in an iframe below the Tauri shell, so its genuine signed cookie must
-    // explicitly allow that third-party context. localhost remains loopback-only, and the
-    // core's Host/Origin fence still rejects cross-site API traffic.
-    cookie.set_path("/");
-    cookie.set_same_site(tauri::webview::cookie::SameSite::None);
-    cookie.set_secure(true);
-    exchange_url.set_query(None);
-    Ok((cookie.to_string(), exchange_url.to_string()))
+    let mut clean_url = exchange_url.clone();
+    clean_url.set_query(None);
+    clean_url.set_fragment(None);
+    Ok((exchange_url.to_string(), clean_url.to_string()))
 }
 
-/// 让真实 WebView HTTP 响应设置 cookie，绕过平台 cookie-adapter 的 SameSite 差异。
-async fn start_harness_cookie_relay(
-    cookie: String,
-    target_url: String,
+/// 让真实 WebView frame 自己跟随官方 token 交换，relay URL 本身不含秘密。
+async fn start_harness_auth_relay(
+    launch_url: String,
     claim: crate::service::workflow::utils::HarnessLaunchClaimId,
 ) -> Result<String, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -177,7 +144,7 @@ async fn start_harness_cookie_relay(
             .and_then(|target| target.split('?').next());
         let response = if request_path == Some(expected_path.as_str()) {
             format!(
-                "HTTP/1.1 303 See Other\r\nLocation: {target_url}\r\nSet-Cookie: {cookie}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 303 See Other\r\nLocation: {launch_url}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
         } else {
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
@@ -430,13 +397,11 @@ pub async fn open_external_url(app_handle: AppHandle, url: String) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::exchange_harness_cookie;
     use super::is_frontend_log_line;
-    use super::start_harness_cookie_relay;
+    use super::prepare_harness_launch_urls;
+    use super::start_harness_auth_relay;
     use super::tail_bytes;
     use crate::service::workflow::utils::HarnessLaunchClaimId;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
 
     #[test]
     fn frontend_line_detected() {
@@ -478,61 +443,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_cookie_exchange_keeps_anonymous_api_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
-        let address = listener.local_addr().expect("fixture address");
-        let server = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().expect("accept fixture request");
-                let mut request = [0_u8; 2048];
-                let size = stream.read(&mut request).expect("read fixture request");
-                let request = String::from_utf8_lossy(&request[..size]);
-                let response = if request.starts_with("GET /api/settings") {
-                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized"
-                } else {
-                    assert!(request.starts_with("GET /?token=one-shot "));
-                    "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: dsh-auth-test=signed; Max-Age=3600; Path=/; HttpOnly; SameSite=Strict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                };
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("write fixture response");
-            }
-        });
+    async fn auth_relay_keeps_token_out_of_the_frontend_url() {
+        let (launch_url, iframe_url) =
+            prepare_harness_launch_urls("http://127.0.0.1:31415/?token=one-shot")
+                .expect("prepare launch URLs");
+        assert_eq!(launch_url, "http://localhost:31415/?token=one-shot");
+        assert_eq!(iframe_url, "http://localhost:31415/");
 
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("fixture client");
-        let anonymous = client
-            .get(format!("http://{address}/api/settings"))
-            .send()
-            .await
-            .expect("anonymous request");
-        assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-        let (cookie_header, iframe_url) = exchange_harness_cookie(&format!(
-            "http://127.0.0.1:{}/?token=one-shot",
-            address.port()
-        ))
-        .await
-        .expect("token exchange");
-        let cookie =
-            tauri::webview::Cookie::parse(cookie_header.clone()).expect("relay cookie parses");
-        assert_eq!(cookie.name(), "dsh-auth-test");
-        assert_eq!(cookie.http_only(), Some(true));
-        assert_eq!(cookie.domain(), None);
-        assert_eq!(cookie.path(), Some("/"));
-        assert_eq!(
-            cookie.same_site(),
-            Some(tauri::webview::cookie::SameSite::None)
-        );
-        assert_eq!(cookie.secure(), Some(true));
-        assert_eq!(iframe_url, format!("http://localhost:{}/", address.port()));
-        server.join().expect("fixture server");
-
-        let relay = start_harness_cookie_relay(
-            cookie_header,
-            iframe_url.clone(),
+        let relay = start_harness_auth_relay(
+            launch_url.clone(),
             HarnessLaunchClaimId {
                 generation: 9,
                 pid: 42,
@@ -554,32 +473,20 @@ mod tests {
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok()),
-            Some(iframe_url.as_str())
+            Some(launch_url.as_str())
         );
-        assert!(relay_response
-            .headers()
-            .get(reqwest::header::SET_COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.contains("SameSite=None") && value.contains("Secure")));
+        assert!(!relay.contains("one-shot"));
     }
 
-    #[tokio::test]
-    async fn transport_error_never_contains_launch_token_or_url() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve fixture port");
-        let address = listener.local_addr().expect("fixture address");
-        drop(listener);
-        let launch_url = format!(
-            "http://127.0.0.1:{}/?token=SENTINEL_SECRET_TOKEN",
-            address.port()
-        );
-        let error = exchange_harness_cookie(&launch_url)
-            .await
-            .expect_err("closed port must fail");
+    #[test]
+    fn invalid_launch_url_error_never_contains_token_or_url() {
+        let launch_url = "https://example.invalid/?token=SENTINEL_SECRET_TOKEN";
+        let error = prepare_harness_launch_urls(launch_url).expect_err("remote URL must fail");
         assert!(!error.contains("SENTINEL_SECRET_TOKEN"));
-        assert!(!error.contains(&launch_url));
+        assert!(!error.contains(launch_url));
         assert_eq!(
             error,
-            "HARNESS_AUTH_EXCHANGE_FAILED: loopback request failed"
+            "HARNESS_AUTH_URL_REJECTED: expected 127.0.0.1 loopback URL"
         );
     }
 
