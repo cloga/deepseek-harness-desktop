@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import process from 'node:process'
 
 const endpoint = 'http://127.0.0.1:4444'
@@ -60,6 +62,7 @@ async function surfaceBounds(surface) {
 async function main() {
   try {
     assert.ok(application, 'DSH_E2E_APPLICATION is required')
+    assert.ok(process.env.APPDATA, 'APPDATA is required')
     const session = await waitFor(
       async () => webdriver('POST', '/session', {
         capabilities: {
@@ -80,6 +83,17 @@ async function main() {
     }, 'authenticated native surface')
     const full = await surfaceBounds(surface)
     assert.ok(full.width > 500 && full.height > 300, `unexpected initial bounds: ${JSON.stringify(full)}`)
+    const desktopLog = join(
+      process.env.APPDATA,
+      'io.github.hairyf.deepseek-harness-desktop',
+      'logs',
+      'desktop.log',
+    )
+    await waitFor(async () => {
+      const log = await readFile(desktopLog, 'utf8')
+      return log.includes('Starting Harness process:')
+        && log.includes('E2E fixture protected request authenticated=true')
+    }, 'natural local core startup evidence')
 
     const shellHandle = await webdriver('GET', `/session/${sessionId}/window`)
     const handles = await webdriver('GET', `/session/${sessionId}/window/handles`)

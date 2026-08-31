@@ -20,12 +20,36 @@ const pluginNames = [
 ]
 const tempDirs: string[] = []
 
+function fnv1a(bytes: Uint8Array): string {
+  let hash = 0xCBF2_9CE4_8422_2325n
+  for (const byte of bytes)
+    hash = BigInt.asUintN(64, (hash ^ BigInt(byte)) * 0x100_0000_01B3n)
+  return hash.toString(16).padStart(16, '0')
+}
+
 afterEach(() => {
   for (const path of tempDirs.splice(0))
     rmSync(path, { recursive: true, force: true })
 })
 
 describe('local core E2E fixture', () => {
+  it('keeps the completed preinstall baseline synchronized with bundled presets', () => {
+    const store = JSON.parse(
+      readFileSync(new URL('./e2e/store.dat', import.meta.url), 'utf8'),
+    )
+    const presets = readFileSync(
+      new URL('../src-tauri/resources/preset-plugins.json', import.meta.url),
+    )
+    expect(store.setting).toMatchObject({
+      active_core: 'local',
+      active_profile: 'web',
+      auto_start: true,
+      installed: true,
+      preinstall_done: true,
+      preset_hash: fnv1a(presets),
+    })
+  })
+
   it('materializes the profile artifacts produced by plugin add', () => {
     const dshHome = mkdtempSync(join(tmpdir(), 'dsh-e2e-fixture-'))
     tempDirs.push(dshHome)
