@@ -51,6 +51,7 @@ pub(crate) const AUTH_TOP_LEVEL_PROBE_JS: &str = r#"(function () {
 #[cfg(test)]
 mod tests {
     use super::AUTH_PROBE_JS;
+    use super::AUTH_TOP_LEVEL_PROBE_JS;
 
     #[test]
     fn probe_executes_protected_request_and_reports_status() {
