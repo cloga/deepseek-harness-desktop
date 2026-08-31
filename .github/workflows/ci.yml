@@ -167,7 +167,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dshHome | Out-Null
           $env:DSH_HOME = $dshHome
           $internalRoot = (
-            Resolve-Path 'src-tauri\target\debug\resources\internal-plugins'
+            Resolve-Path 'src-tauri\resources\node_modules'
           ).Path.Replace('\', '/')
           $pluginNames = @(
             'dsh-tauri',
@@ -178,6 +178,19 @@ jobs:
             'dsh-tauri-session',
             'dsh-tauri-rightclick'
           )
+          foreach ($pluginName in $pluginNames) {
+            $manifestPath = Join-Path $internalRoot "$pluginName/package.json"
+            if (-not (Test-Path $manifestPath)) {
+              throw "Built plugin manifest missing: $manifestPath"
+            }
+            $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.main) {
+              $entryPath = Join-Path (Split-Path $manifestPath) $manifest.main
+              if (-not (Test-Path $entryPath)) {
+                throw "Built plugin entry missing: $entryPath"
+              }
+            }
+          }
           $specs = $pluginNames | ForEach-Object { "link:$internalRoot/$_" }
           & node test\e2e\local-core\node_modules\@deepseek-ai\dsh\lib\bin.js `
             plugin --profile web add @specs

@@ -106,6 +106,21 @@ describe('local core E2E fixture', () => {
     )
   })
 
+  it('links the E2E profile to the deployed plugin build output', () => {
+    const workflow = readFileSync(
+      new URL('../.github/workflows/ci.yml', import.meta.url),
+      'utf8',
+    )
+    expect(workflow).toContain(
+      'Resolve-Path \'src-tauri\\resources\\node_modules\'',
+    )
+    expect(workflow).toContain('Built plugin manifest missing:')
+    expect(workflow).toContain('Built plugin entry missing:')
+    expect(workflow).not.toContain(
+      'Resolve-Path \'src-tauri\\target\\debug\\resources\\internal-plugins\'',
+    )
+  })
+
   it('keeps the completed preinstall baseline synchronized with bundled presets', () => {
     const store = JSON.parse(
       readFileSync(new URL('./e2e/store.dat', import.meta.url), 'utf8'),
