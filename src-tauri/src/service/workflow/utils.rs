@@ -163,7 +163,13 @@ fn claim_harness_launch(
         HarnessLaunchConsumer::Browser => owner.browser_pending,
     };
     if !pending {
-        return Ok(None);
+        return match consumer {
+            HarnessLaunchConsumer::Webview => Ok(None),
+            HarnessLaunchConsumer::Browser if owner.authenticated_port.is_none() => Ok(None),
+            HarnessLaunchConsumer::Browser => {
+                Err("HARNESS_AUTH_HANDOFF_USED: authentication handoff was already used".into())
+            }
+        };
     }
     if owner.in_flight.is_some() {
         return Err("HARNESS_AUTH_HANDOFF_BUSY: another authentication delivery is active".into());
@@ -833,7 +839,7 @@ mod tests {
             .unwrap()
             .expect("browser claim");
         assert!(finish_harness_launch_claim(&browser, true));
-        assert!(claim_harness_browser_launch(3083).unwrap().is_none());
+        assert!(claim_harness_browser_launch(3083).is_err());
         assert!(!has_authenticated_harness_launch(3080));
         clear_harness_launch_url();
     }
