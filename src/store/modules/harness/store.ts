@@ -585,7 +585,6 @@ export const harness = defineStore({
             return false
           }
           await finishHarnessWebviewClaim(preparation, true)
-          await invoke('show_harness_webview')
           this.markIframeLoaded()
         }
         catch (error) {
