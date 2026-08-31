@@ -74,6 +74,11 @@ fn webview_automation_enabled() -> bool {
     std::env::var("TAURI_WEBVIEW_AUTOMATION").as_deref() == Ok("true")
 }
 
+#[cfg(feature = "webdriver")]
+fn parse_webdriver_port(value: Option<&str>) -> Option<u16> {
+    value?.parse().ok().filter(|port| *port != 0)
+}
+
 /// setup app
 pub fn setup(app_handle: tauri::AppHandle) {
     // 升级清理：内部插件资源已迁至 resources/internal-plugins；旧安装可能保留
@@ -651,6 +656,17 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
 // configure tauri builder
 pub fn builder() -> tauri::Builder<tauri::Wry> {
     let builder = tauri::Builder::default();
+    // 内嵌 WebDriver 仅供显式测试 feature 使用，且必须同时提供监听端口。
+    #[cfg(feature = "webdriver")]
+    let builder = match parse_webdriver_port(
+        std::env::var(tauri_plugin_wdio_webdriver::PORT_ENV_VAR)
+            .ok()
+            .as_deref(),
+    ) {
+        Some(port) => builder.plugin(tauri_plugin_wdio_webdriver::init_with_port(port)),
+        None => builder,
+    };
+
     let builder = builder
         .setup(|app| {
             let app_handle = app.handle().clone();
