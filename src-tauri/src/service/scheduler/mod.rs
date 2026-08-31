@@ -22,6 +22,8 @@ async fn scheduler_permanent_loop(app_handle: AppHandle) {
         crate::config::check_and_emit_theme(&app_handle);
         // 已安装插件文件监控：指纹变化（防抖后）推送 `dsh-plugins-updated`
         crate::service::plugin::watch::check_and_emit(&app_handle);
+        // 自动备份检查：决策轻量（几次比较），命中后 spawn_blocking 执行
+        crate::service::backup::schedule::check_and_trigger(&app_handle);
         interval.tick().await;
     }
 }

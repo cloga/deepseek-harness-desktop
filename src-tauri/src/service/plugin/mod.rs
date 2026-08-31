@@ -28,6 +28,7 @@
 //! - [`watch`]：已安装插件文件监控（轮询指纹比对 + `dsh-plugins-updated` 事件推送）
 
 mod cancel;
+pub mod disable;
 pub mod errors;
 mod install;
 mod installed;
@@ -50,6 +51,7 @@ pub(crate) use internal::cancel as cancel_internal_plugins;
 pub(crate) use internal::ensure as ensure_internal_plugins;
 pub use preset::repo_url_of;
 pub(crate) use preset::{current_preset_hash, preinstall_pending, remove_legacy_bundled_plugins};
+pub use disable::{disable, enable};
 pub use recovery::{
     detect as detect_recovery, uninstall as uninstall_recovery, PluginRecoveryInfo,
 };

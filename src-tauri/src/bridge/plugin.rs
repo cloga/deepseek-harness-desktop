@@ -176,3 +176,21 @@ pub fn recover_plugin(app_handle: AppHandle, id: String) -> Result<(), String> {
     plugin::watch::force_emit(&app_handle);
     Ok(())
 }
+
+/// 禁用单个已安装插件：从 profile 的 `dsh.profile.bundles` 移除（代码完全不加载），
+/// 并写入 profile 的独立禁用清单。与卸载不同，禁用保留 node_modules 内的包体，
+/// 启用时无需重新下载。
+#[tauri::command]
+pub fn disable_dsh_plugin(app_handle: AppHandle, id: String) -> Result<(), String> {
+    plugin::disable(&app_handle, &id)?;
+    plugin::watch::force_emit(&app_handle);
+    Ok(())
+}
+
+/// 启用单个已禁用的插件：加回 `dsh.profile.bundles` 并从独立禁用清单移除。
+#[tauri::command]
+pub fn enable_dsh_plugin(app_handle: AppHandle, id: String) -> Result<(), String> {
+    plugin::enable(&app_handle, &id)?;
+    plugin::watch::force_emit(&app_handle);
+    Ok(())
+}

@@ -27,7 +27,7 @@ export function Item({ left, right, footer, onClick, className }: ItemProps) {
       onClick={onClick}
     >
       <Card.Content className="flex flex-col gap-1.5">
-        <div className="flex flex-row items-center justify-between">
+        <div className="flex flex-row items-center justify-between gap-2">
           <div className="flex min-w-0 items-center gap-1">{left}</div>
           <div className="flex shrink-0 items-center gap-1.5">{right}</div>
         </div>

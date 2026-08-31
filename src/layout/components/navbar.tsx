@@ -212,6 +212,7 @@ export function Navbar({ iframeRef }: NavbarProps) {
     openAbout: handleOpenAbout,
     copyRunLogs: () => { void copyRunLogs() },
     checkUpdate: () => { void handleCheckUpdate() },
+    restartHarness: () => { void store.harness.restart() },
   })
 
   return (

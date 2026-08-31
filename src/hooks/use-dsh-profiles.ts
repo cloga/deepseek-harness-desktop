@@ -25,7 +25,9 @@ export interface UseDshProfilesResult {
   activateProfile: (id: string) => Promise<Profile>
   /** 删除档案（默认/使用中的档案会被后端拒绝） */
   removeProfile: (id: string) => Promise<void>
-  /** 操作进行中标记（新建/切换/删除任一） */
+  /** 克隆档案（全量复制源档案，自动递增或指定名称） */
+  cloneProfile: (sourceId: string, name: string) => Promise<Profile>
+  /** 操作进行中标记（新建/切换/删除/克隆任一） */
   busy: boolean
 }
 
@@ -79,6 +81,10 @@ export function useDshProfiles(): UseDshProfilesResult {
     mutationFn: (id: string) => invoke<void>('remove_profile', { id }),
     onSuccess: invalidate,
   })
+  const clone = useMutation({
+    mutationFn: (params: { sourceId: string, name: string }) => invoke<Profile>('clone_profile', params),
+    onSuccess: invalidate,
+  })
 
   return {
     profiles: data ?? [],
@@ -98,6 +104,11 @@ export function useDshProfiles(): UseDshProfilesResult {
       await remove.mutateAsync(id)
       await refetch()
     },
-    busy: create.isPending || activate.isPending || remove.isPending,
+    cloneProfile: async (sourceId, name) => {
+      const created = await clone.mutateAsync({ sourceId, name })
+      await refetch()
+      return created
+    },
+    busy: create.isPending || activate.isPending || remove.isPending || clone.isPending,
   }
 }

@@ -1,5 +1,5 @@
 import type { PropsWithOverlays } from '@overlastic/react'
-import { Cpu, PersonPencil, Puzzle, Wrench } from '@gravity-ui/icons'
+import { Cpu, LogoWindows, PersonPencil, Puzzle } from '@gravity-ui/icons'
 import { useEventBus } from '@hairy/react-lib'
 import { cn, Modal } from '@heroui/react'
 import { useDisclosure } from '@overlastic/react'
@@ -22,13 +22,13 @@ export function ConfigDialog(props: ConfigDialogProps) {
   const abnormalCount = plugins.filter(p => p.error != null).length
 
   const navs = [
-    { label: t('config.debug'), value: 'debug', icon: Wrench },
+    { label: t('config.application'), value: 'application', icon: LogoWindows },
     { label: t('config.profiles'), value: 'profiles', icon: PersonPencil },
     { label: t('config.plugins'), value: 'plugins', icon: Puzzle },
     { label: t('config.harness'), value: 'harness', icon: Cpu },
   ]
 
-  const [activeTab, setActiveTab] = useState('debug')
+  const [activeTab, setActiveTab] = useState('application')
 
   useEventBus('config:dialog:hidden').on(disclosure.cancel)
 
@@ -69,9 +69,9 @@ export function ConfigDialog(props: ConfigDialogProps) {
                   })}
                 </nav>
               </aside>
-              <div className="flex flex-col flex-1 overflow-auto min-h-0 max-h-[628px] pr-2.5">
+              <div className="flex flex-col flex-1 overflow-auto min-h-0 pr-2.5">
                 <Switch value={activeTab} as="div">
-                  <Case cond="debug">
+                  <Case cond="application">
                     <ConfigDebug />
                   </Case>
                   <Case cond="profiles">

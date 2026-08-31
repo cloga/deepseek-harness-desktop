@@ -29,3 +29,9 @@ pub fn set_active_profile(app_handle: AppHandle, id: String) -> Result<profile::
 pub fn remove_profile(app_handle: AppHandle, id: String) -> Result<(), String> {
     profile::remove(&app_handle, &id)
 }
+
+/// 克隆档案（全量复制源档案目录，自动递增命名或指定名称）
+#[tauri::command]
+pub fn clone_profile(app_handle: AppHandle, source_id: String, name: Option<String>) -> Result<profile::Profile, String> {
+    profile::clone(&app_handle, &source_id, name.as_deref())
+}

@@ -1,7 +1,7 @@
 use super::constants::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_store::StoreExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +50,30 @@ pub struct Setting {
     /// 归一化到受支持的 50%–200% 范围和 10% 步长。
     #[serde(default = "default_zoom_factor")]
     pub zoom_factor: f64,
+    /// 点击窗口关闭按钮时的行为：`tray` = 隐藏到托盘继续驻留，`quit` = 直接退出应用。
+    /// 只接受 `tray` / `quit` 两个字面量，读取与写入时均归一化，未知值回落 `tray`；
+    /// 字段刻意用 `String` 而非 enum——任一字段反序列化失败会让整个 `Setting` 回落
+    /// 默认，严格 enum 的一个意外值会连带清空端口/语言/档案等全部设置。
+    #[serde(default = "default_close_action")]
+    pub close_action: String,
+    /// 是否启用自动备份。
+    #[serde(default)]
+    pub auto_backup_enabled: bool,
+    /// 自动备份间隔（天）。
+    #[serde(default = "default_auto_backup_interval_days")]
+    pub auto_backup_interval_days: u32,
+    /// 是否在每次启动时自动备份。
+    #[serde(default)]
+    pub auto_backup_on_startup: bool,
+    /// 是否在配置变化时自动备份。
+    #[serde(default)]
+    pub auto_backup_on_change: bool,
+    /// 最多保留备份份数。
+    #[serde(default = "default_backup_retention_count")]
+    pub backup_retention_count: u32,
+    /// 备份是否包含凭据文件（`.credentials.yaml`）。
+    #[serde(default)]
+    pub backup_include_credentials: bool,
 }
 
 pub const ZOOM_FACTOR_MIN: f64 = 0.5;
@@ -71,6 +95,32 @@ pub fn default_zoom_factor() -> f64 {
     1.0
 }
 
+/// 默认关闭行为：隐藏到托盘继续驻留（D-09）。
+pub fn default_close_action() -> String {
+    "tray".to_string()
+}
+
+/// 自动备份默认间隔：7 天。
+pub fn default_auto_backup_interval_days() -> u32 {
+    7
+}
+
+/// 默认保留备份份数：10 份。
+pub fn default_backup_retention_count() -> u32 {
+    10
+}
+
+/// 把外部或旧存储中的关闭行为收敛到白名单，未知值一律回落到默认行为。
+///
+/// 只做精确匹配：不做 `trim()`、不做大小写折叠——store 可被手工编辑、旧版本或其它
+/// 平台写入，宽松匹配会让 `"quit "` / `"TRAY"` 这类值以非预期形态进入下游判断。
+pub fn normalize_close_action(value: &str) -> String {
+    match value {
+        "tray" | "quit" => value.to_string(),
+        _ => default_close_action(),
+    }
+}
+
 /// 将外部或旧存储中的缩放值限制到桌面端支持的稳定步长。
 pub fn normalize_zoom_factor(value: f64) -> f64 {
     if !value.is_finite() {
@@ -79,6 +129,34 @@ pub fn normalize_zoom_factor(value: f64) -> f64 {
     let clamped = value.clamp(ZOOM_FACTOR_MIN, ZOOM_FACTOR_MAX);
     let steps_per_unit = 1.0 / ZOOM_FACTOR_STEP;
     (clamped * steps_per_unit).round() / steps_per_unit
+}
+
+/// 归一化自动备份设置：把间隔和保留份数限制在有效范围内。
+///
+/// - `interval_days` 限制在 [1, 90]，未知/越界回落默认 7。
+/// - `retention_count` 限制在 [1, 50]，未知/越界回落默认 10。
+pub fn normalize_backup_settings(interval_days: u32, retention_count: u32) -> (u32, u32) {
+    let interval = if interval_days == 0 || interval_days > 90 {
+        default_auto_backup_interval_days()
+    } else {
+        interval_days
+    };
+    let retention = if retention_count == 0 || retention_count > 50 {
+        default_backup_retention_count()
+    } else {
+        retention_count
+    };
+    (interval, retention)
+}
+
+/// 把 Setting 的备份字段归一化到有效范围。
+fn normalize_backup_fields(setting: &mut Setting) {
+    let (interval, retention) = normalize_backup_settings(
+        setting.auto_backup_interval_days,
+        setting.backup_retention_count,
+    );
+    setting.auto_backup_interval_days = interval;
+    setting.backup_retention_count = retention;
 }
 
 /// 默认服务端口：debug 构建与生产隔离，避免开发时与已运行的桌面端争用 3080。
@@ -107,6 +185,13 @@ impl Default for Setting {
             active_core: None,
             manual_port: None,
             zoom_factor: default_zoom_factor(),
+            close_action: default_close_action(),
+            auto_backup_enabled: false,
+            auto_backup_interval_days: default_auto_backup_interval_days(),
+            auto_backup_on_startup: false,
+            auto_backup_on_change: false,
+            backup_retention_count: default_backup_retention_count(),
+            backup_include_credentials: false,
         }
     }
 }
@@ -130,7 +215,7 @@ fn setting_write_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn read_store_dat_setting(app_handle: &AppHandle) -> Setting {
+fn read_store_dat_setting<R: Runtime>(app_handle: &AppHandle<R>) -> Setting {
     let store = app_handle
         .store(store_dat_file_name())
         .expect("Failed to load store");
@@ -144,6 +229,8 @@ fn read_store_dat_setting(app_handle: &AppHandle) -> Setting {
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_else(Setting::default);
     setting.zoom_factor = normalize_zoom_factor(setting.zoom_factor);
+    setting.close_action = normalize_close_action(&setting.close_action);
+    normalize_backup_fields(&mut setting);
     setting
 }
 
@@ -163,20 +250,22 @@ fn emit_setting(app_handle: &AppHandle, value: &serde_json::Value) {
         .expect("Failed to emit event");
 }
 
-fn preserve_persisted_zoom(mut replacement: Setting, persisted_zoom: f64) -> Setting {
-    replacement.zoom_factor = normalize_zoom_factor(persisted_zoom);
+fn preserve_persisted_fields(mut replacement: Setting, current: &Setting) -> Setting {
+    replacement.zoom_factor = normalize_zoom_factor(current.zoom_factor);
+    replacement.close_action = normalize_close_action(&current.close_action);
     replacement
 }
 
-/// 兼容旧调用方的整对象写入，但始终保留锁内读到的最新缩放，避免长流程用陈旧
-/// `Setting` 覆盖刚刚由快捷键写入的值。
-pub fn set_store_dat_setting(app_handle: &AppHandle, setting: Setting) {
+/// 兼容旧调用方的整对象写入，但始终保留锁内读到的最新缩放与关窗动作，避免
+/// 长流程用陈旧 `Setting` 覆盖刚刚由快捷键 / 设置界面写入的值（丢更新）。
+pub fn set_store_dat_setting(app_handle: &AppHandle, mut setting: Setting) {
     let value = {
         let _guard = setting_write_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let current = read_store_dat_setting(app_handle);
-        let setting = preserve_persisted_zoom(setting, current.zoom_factor);
+        setting = preserve_persisted_fields(setting, &current);
+        normalize_backup_fields(&mut setting);
         write_store_dat_setting(app_handle, &setting)
     };
     emit_setting(app_handle, &value);
@@ -194,6 +283,9 @@ where
         let mut setting = read_store_dat_setting(app_handle);
         update(&mut setting);
         setting.zoom_factor = normalize_zoom_factor(setting.zoom_factor);
+        // 落盘前的第二道闸：调用方（含前端 invoke）写入的不可信取值不以原始形态进 store
+        setting.close_action = normalize_close_action(&setting.close_action);
+        normalize_backup_fields(&mut setting);
         let value = write_store_dat_setting(app_handle, &setting);
         (setting, value)
     };
@@ -207,7 +299,9 @@ pub fn set_store_dat_zoom_factor(app_handle: &AppHandle, zoom_factor: f64) -> Se
     })
 }
 
-pub fn get_store_dat_setting(app_handle: &AppHandle) -> Setting {
+/// 泛型 `Runtime`：允许从非 Wry 具体化的窗口句柄（如工具函数的
+/// `WebviewWindow<R>`）读取设置；具体类型调用方不受影响。
+pub fn get_store_dat_setting<R: Runtime>(app_handle: &AppHandle<R>) -> Setting {
     let _guard = setting_write_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -241,8 +335,8 @@ pub fn set_dsh_pkg_tag(app_handle: &AppHandle, tag: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_zoom_factor, normalize_zoom_factor, preserve_persisted_zoom, Setting,
-        ZOOM_FACTOR_MAX, ZOOM_FACTOR_MIN,
+        default_close_action, default_zoom_factor, normalize_close_action, normalize_zoom_factor,
+        preserve_persisted_fields, Setting, ZOOM_FACTOR_MAX, ZOOM_FACTOR_MIN,
     };
 
     #[test]
@@ -275,12 +369,98 @@ mod tests {
     }
 
     #[test]
-    fn legacy_full_setting_write_preserves_latest_zoom() {
+    fn legacy_full_setting_write_preserves_latest_fields() {
         let mut stale = Setting::default();
         stale.zoom_factor = 0.8;
+        stale.close_action = "quit".to_string();
 
-        let merged = preserve_persisted_zoom(stale, 1.6);
+        let mut current = Setting::default();
+        current.zoom_factor = 1.6;
+        current.close_action = "tray".to_string();
+
+        let merged = preserve_persisted_fields(stale, &current);
 
         assert_eq!(merged.zoom_factor, 1.6);
+        assert_eq!(
+            merged.close_action, "tray",
+            "整对象写入不得用陈旧值覆盖锁内读到的最新关窗动作"
+        );
+    }
+
+    #[test]
+    fn close_action_defaults_for_legacy_settings() {
+        let setting: Setting = serde_json::from_value(serde_json::json!({
+            "installed": true,
+            "port": 4099,
+            "auto_start": true,
+            "language": "en-US"
+        }))
+        .expect("legacy setting should deserialize");
+
+        assert_eq!(
+            setting.close_action,
+            default_close_action(),
+            "旧配置缺失 close_action 时应回落默认"
+        );
+        assert_eq!(setting.port, 4099, "缺失 close_action 不应影响其余字段");
+    }
+
+    #[test]
+    fn close_action_normalizes_unknown_values() {
+        assert_eq!(normalize_close_action("tray"), "tray");
+        assert_eq!(normalize_close_action("quit"), "quit");
+
+        for raw in ["", "TRAY", "bogus", "quit ", "tray;drop"] {
+            assert_eq!(
+                normalize_close_action(raw),
+                "tray",
+                "非法值 {raw} 应回落默认"
+            );
+        }
+
+        let setting: Setting = serde_json::from_value(serde_json::json!({
+            "installed": true,
+            "port": 4099,
+            "auto_start": true,
+            "language": "en-US",
+            "close_action": "bogus"
+        }))
+        .expect("tampered setting should deserialize");
+
+        assert_eq!(
+            normalize_close_action(&setting.close_action),
+            "tray",
+            "store 中的非法值应在读取路径被归一化"
+        );
+        assert_eq!(
+            setting.port, 4099,
+            "非法 close_action 不得触发 Setting 整体回落默认"
+        );
+    }
+
+    #[test]
+    fn close_action_default_is_tray() {
+        assert_eq!(
+            default_close_action(),
+            "tray",
+            "新用户默认关闭行为为隐藏到托盘"
+        );
+        assert_eq!(Setting::default().close_action, "tray");
+    }
+
+    #[test]
+    fn close_action_round_trip() {
+        let setting = Setting {
+            close_action: "quit".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&setting).expect("setting should serialize");
+        let restored: Setting = serde_json::from_str(&json).expect("setting should deserialize");
+
+        assert_eq!(
+            normalize_close_action(&restored.close_action),
+            "quit",
+            "写入 store 再读回后关闭行为应保持不变"
+        );
     }
 }

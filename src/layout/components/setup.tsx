@@ -1,9 +1,14 @@
 import type { IconComponent } from './loadable'
 import type { SetupStatus } from '@/store/modules/harness'
-import { ArrowDownToLine, CircleCheck, CircleExclamation, CircleInfo, Magnifier, Rocket } from '@gravity-ui/icons'
+import { ArrowDownToLine, CircleCheck, CircleExclamation, CircleInfo, Copy, Magnifier, Rocket } from '@gravity-ui/icons'
+import { invoke } from '@tauri-apps/api/core'
 import { useTranslation } from 'react-i18next'
+import { If, Then } from 'react-if-lite'
 import { useStore } from 'valtio-define'
+import { button } from '@/components/primitives'
 import { store } from '@/store'
+import { writeClipboardText } from '@/utils/clipboard'
+import { toast } from '@/utils/toast'
 import { Loadable } from './loadable'
 
 // 各阶段对应不同图标，保持与 logo 一致的黑白中性色调
@@ -14,6 +19,18 @@ const STATUS_ICONS: Record<SetupStatus, IconComponent> = {
   preinstall: CircleInfo,
   ready: CircleCheck,
   error: CircleExclamation,
+}
+
+async function copyLogsHandler(t: (key: string) => string) {
+  try {
+    const logs = await invoke<string>('read_run_logs')
+    await writeClipboardText(logs)
+    toast(t('messages.logs_copied'), {})
+  }
+  catch (err) {
+    console.error('[Setup] failed to copy logs:', err)
+    toast(t('messages.logs_copy_failed'), { variant: 'danger' })
+  }
 }
 
 /**
@@ -56,6 +73,17 @@ export function Setup() {
       {hint && (
         <p className="m-0 text-xs leading-[18px] break-all text-load-muted">{hint}</p>
       )}
+      <If cond={error}>
+        <Then>
+          <button
+            className={button({ tone: 'ghost', size: 'sm' })}
+            onClick={() => copyLogsHandler(t)}
+          >
+            <Copy className="size-4" />
+            {t('buttons.copy_logs')}
+          </button>
+        </Then>
+      </If>
     </Loadable>
   )
 }

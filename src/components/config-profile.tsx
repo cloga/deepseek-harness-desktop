@@ -1,5 +1,5 @@
 import { Plus } from '@gravity-ui/icons'
-import { Button, Checkbox, Chip, Description, Input, Label } from '@heroui/react'
+import { AlertDialog, Button, Checkbox, Chip, Description, Input, Label } from '@heroui/react'
 import { useOverlay } from '@overlastic/react'
 import { useState } from 'react'
 
@@ -8,11 +8,14 @@ import { If } from 'react-if-lite'
 import { store } from '@/store'
 import { toast } from '@/utils/toast'
 import { useDshProfiles } from '../hooks/use-dsh-profiles'
+import { ConfigBackup } from './config-backup'
 import { Ellipsis } from './ellipsis'
 import { Item } from './item'
 import { Modal } from './modal'
 import { PanelHeader } from './panel-header'
 import { PanelState } from './panel-state'
+
+type ProfileView = 'list' | { profile: string }
 
 export function ConfigProfile() {
   /**
@@ -23,13 +26,58 @@ export function ConfigProfile() {
    * 桌面端把「当前档案」持久化在 store（`active_profile`），服务启动与插件管理
    * 都以它为准。切换档案需要重启服务才生效（toast 内提供重启入口）。
    */
-  const { profiles, loading, error, createProfile, activateProfile, removeProfile, busy } = useDshProfiles()
+  const { profiles, loading, error, createProfile, activateProfile, removeProfile, cloneProfile, busy } = useDshProfiles()
 
   const [dialogHolder, openDialog] = useOverlay(Modal, { type: 'holder' })
 
   const { t } = useTranslation()
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
+  const [activeView, setActiveView] = useState<ProfileView>('list')
+
+  // 克隆档案：命名对话框状态
+  const [cloning, setCloning] = useState<{ sourceId: string, sourceName: string } | null>(null)
+  const [cloneName, setCloneName] = useState('')
+
+  /** 推导下一个未占用的自动递增名称（仅作为建议，后端才是权威） */
+  function suggestCloneName(base: string): string {
+    const taken = new Set(profiles.map(p => p.id))
+    for (let n = 1; n <= 1000; n++) {
+      const candidate = `${base}-${n}`
+      if (!taken.has(candidate))
+        return candidate
+    }
+    return `${base}-1`
+  }
+
+  function openCloneDialog(profile: { id: string, name: string }) {
+    setCloning({ sourceId: profile.id, sourceName: profile.name })
+    setCloneName(suggestCloneName(profile.id))
+  }
+
+  async function commitClone() {
+    if (!cloning)
+      return
+    const trimmed = cloneName.trim()
+    if (!trimmed) {
+      toast(t('profiles.clone_empty'), {})
+      return
+    }
+    try {
+      await cloneProfile(cloning.sourceId, trimmed)
+      setCloning(null)
+      setCloneName('')
+      toast(t('profiles.clone_success', { name: trimmed }), {
+        variant: 'accent',
+        description: t('profiles.clone_success_hint'),
+        timeout: 10_000,
+      })
+    }
+    catch (err) {
+      console.error('[ConfigProfile] clone failed:', err)
+      toast(t('profiles.clone_failed'), {})
+    }
+  }
 
   async function activate(id: string) {
     const target = profiles.find(p => p.id === id)
@@ -125,6 +173,13 @@ export function ConfigProfile() {
     }
   }
 
+  // 备份子视图：点击档案的「备份」芯片后进入
+  if (activeView !== 'list') {
+    return (
+      <ConfigBackup onBack={() => setActiveView('list')} />
+    )
+  }
+
   return (
     <div className="space-y-3">
       <PanelHeader title={t('profiles.title')} description={t('profiles.tooltip')} />
@@ -162,15 +217,38 @@ export function ConfigProfile() {
                       </Checkbox.Control>
                     </Checkbox.Content>
                   </Checkbox>
+                  <Chip
+                    className="rounded-md"
+                    size="sm"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      setActiveView({ profile: profile.id })
+                    }}
+                  >
+                    {t('backup.manage')}
+                  </Chip>
+                  <Chip
+                    className={`rounded-md${busy ? ' cursor-not-allowed opacity-50' : ' cursor-pointer'}`}
+                    color="accent"
+                    size="sm"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      if (!busy)
+                        openCloneDialog(profile)
+                    }}
+                  >
+                    {t('profiles.clone')}
+                  </Chip>
                   <If cond={!profile.default}>
                     <Chip
-                      className="rounded-md"
+                      className={`rounded-md${busy ? ' cursor-not-allowed opacity-50' : ' cursor-pointer'}`}
                       variant="primary"
                       color="danger"
                       size="sm"
                       onClick={(event) => {
                         event.stopPropagation()
-                        remove(profile.id)
+                        if (!busy)
+                          remove(profile.id)
                       }}
                     >
                       {t('profiles.remove')}
@@ -225,6 +303,62 @@ export function ConfigProfile() {
         </div>
       </PanelState>
       {dialogHolder}
+
+      {/* 克隆档案：命名对话框（创建型，accent；可编辑建议名称） */}
+      <AlertDialog
+        isOpen={cloning !== null}
+        onOpenChange={(open) => {
+          if (!open)
+            setCloning(null)
+        }}
+      >
+        <AlertDialog.Backdrop>
+          <AlertDialog.Container>
+            <AlertDialog.Dialog className="sm:max-w-[400px]">
+              <AlertDialog.CloseTrigger />
+              <AlertDialog.Header>
+                <AlertDialog.Icon status="accent" />
+                <AlertDialog.Heading>{t('profiles.clone_dialog_title')}</AlertDialog.Heading>
+              </AlertDialog.Header>
+              <AlertDialog.Body>
+                <p className="text-xs text-muted">
+                  {cloning && t('profiles.clone_dialog_desc', { name: cloning.sourceName })}
+                </p>
+                <Input
+                  autoFocus
+                  variant="secondary"
+                  className="h-8 rounded-md w-full my-2"
+                  placeholder={t('profiles.clone_name_placeholder')}
+                  value={cloneName}
+                  onChange={e => setCloneName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter')
+                      commitClone()
+                  }}
+                />
+                {cloning && (
+                  <p className="text-xs text-muted">
+                    {t('profiles.clone_default_hint', { name: suggestCloneName(cloning.sourceId) })}
+                  </p>
+                )}
+              </AlertDialog.Body>
+              <AlertDialog.Footer>
+                <Button className="rounded-md" variant="tertiary" onPress={() => setCloning(null)}>
+                  {t('profiles.clone_cancel')}
+                </Button>
+                <Button
+                  className="rounded-md"
+                  variant="primary"
+                  isDisabled={!cloneName.trim() || busy}
+                  onPress={commitClone}
+                >
+                  {t('profiles.clone_confirm')}
+                </Button>
+              </AlertDialog.Footer>
+            </AlertDialog.Dialog>
+          </AlertDialog.Container>
+        </AlertDialog.Backdrop>
+      </AlertDialog>
     </div>
   )
 }
