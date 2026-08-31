@@ -5,6 +5,7 @@ import {
   hasBlockingOverlay,
   serializeNativeWebviewBounds,
   shouldShowNativeWebview,
+  shouldSyncNativeWebviewBounds,
 } from '../src/utils/native-webview-visibility'
 
 describe('native WebView visibility', () => {
@@ -12,6 +13,12 @@ describe('native WebView visibility', () => {
     expect(shouldShowNativeWebview(true, true, false, false)).toBe(false)
     expect(shouldShowNativeWebview(true, true, true, false)).toBe(true)
     expect(shouldShowNativeWebview(true, true, true, true)).toBe(false)
+  })
+
+  it('does not resize the native child until its authenticated probe is ready', () => {
+    expect(shouldSyncNativeWebviewBounds(true, true, false)).toBe(false)
+    expect(shouldSyncNativeWebviewBounds(true, false, true)).toBe(false)
+    expect(shouldSyncNativeWebviewBounds(true, true, true)).toBe(true)
   })
 
   it('recognizes a blocking overlay through the shared selector', () => {

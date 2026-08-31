@@ -17,6 +17,7 @@ import {
   hasBlockingOverlay,
   serializeNativeWebviewBounds,
   shouldShowNativeWebview,
+  shouldSyncNativeWebviewBounds,
 } from '@/utils/native-webview-visibility'
 import { Loadable } from './loadable'
 import { Navbar } from './navbar'
@@ -124,7 +125,9 @@ export function Webview() {
     }
   }, [iframeKey, iframeSrc, nativeWebview, nativeWebviewOrigin, serviceHealthy])
   useEffect(() => {
-    if (!nativeWebview || !nativeWebviewMounted)
+    // WebView2 初始导航完成前重设 child bounds 可能阻断 relay 请求；mount 已在
+    // Rust 端以 offscreen 尺寸创建，probe ready 后本 effect 会立即应用最新布局。
+    if (!shouldSyncNativeWebviewBounds(nativeWebview, nativeWebviewMounted, iframeLoaded))
       return
     let lastState = ''
     let syncQueue = Promise.resolve()

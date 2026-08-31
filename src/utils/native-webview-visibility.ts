@@ -90,3 +90,11 @@ export function shouldShowNativeWebview(
 ): boolean {
   return nativeWebview && serviceHealthy && iframeLoaded && !blockingOverlay
 }
+
+export function shouldSyncNativeWebviewBounds(
+  nativeWebview: boolean,
+  nativeWebviewMounted: boolean,
+  iframeLoaded: boolean,
+): boolean {
+  return nativeWebview && nativeWebviewMounted && iframeLoaded
+}
