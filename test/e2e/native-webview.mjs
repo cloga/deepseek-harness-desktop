@@ -8,13 +8,13 @@ const application = process.env.DSH_E2E_APPLICATION
 let sessionId
 
 function runShellScenario(done) {
+  const scenarioDeadline = Date.now() + 25_000
   function sleep(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds))
   }
-  async function waitForValue(callback, label, timeout = 25_000) {
-    const deadline = Date.now() + timeout
+  async function waitForValue(callback, label) {
     let lastError
-    while (Date.now() < deadline) {
+    while (Date.now() < scenarioDeadline) {
       try {
         const value = callback()
         if (value)
