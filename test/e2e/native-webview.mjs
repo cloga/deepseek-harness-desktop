@@ -59,6 +59,38 @@ async function surfaceBounds(surface) {
   }
 }
 
+function occurrenceCount(value, needle) {
+  return value.split(needle).length - 1
+}
+
+async function readDesktopLog(path) {
+  return readFile(path, 'utf8')
+}
+
+async function waitForAuthenticatedCycle(desktopLog, minimumProbeCount, label) {
+  return waitFor(async () => {
+    const log = await readDesktopLog(desktopLog)
+    return occurrenceCount(log, '[harness-webview] protected probe completed: status=200') >= minimumProbeCount
+      && occurrenceCount(log, 'E2E fixture protected request authenticated=true') >= minimumProbeCount
+  }, label)
+}
+
+async function assertSingleTokenExchange(desktopLog) {
+  const log = await readDesktopLog(desktopLog)
+  assert.equal(
+    occurrenceCount(log, 'E2E fixture auth exchange request'),
+    1,
+    'completed native session must not reuse the one-shot token',
+  )
+  for (const forbidden of [
+    'HARNESS_AUTH_HANDOFF_USED',
+    'missing required key x',
+    'HARNESS_IFRAME_AUTH_TIMEOUT',
+  ]) {
+    assert.equal(log.includes(forbidden), false, `unexpected Desktop log marker: ${forbidden}`)
+  }
+}
+
 async function main() {
   try {
     assert.ok(application, 'DSH_E2E_APPLICATION is required')
@@ -85,7 +117,7 @@ async function main() {
       'desktop.log',
     )
     await waitFor(async () => {
-      const log = await readFile(desktopLog, 'utf8')
+      const log = await readDesktopLog(desktopLog)
       return log.includes('Starting Harness process:')
         && log.includes('[harness-webview] auth relay request accepted')
         && log.includes('[harness-webview] protected probe completed: status=200')
@@ -148,6 +180,28 @@ async function main() {
     )
     await click(close)
     await waitFor(async () => (await surfaceBounds(surface)).width === full.width, 'Settings bounds restore')
+
+    await webdriver('POST', `/session/${sessionId}/refresh`, {})
+    await waitForAuthenticatedCycle(desktopLog, 2, 'same-service Retry authentication')
+    await assertSingleTokenExchange(desktopLog)
+
+    await webdriver('POST', `/session/${sessionId}/execute/sync`, {
+      script: 'return window.__TAURI_INTERNALS__.invoke("close_harness_webview")',
+      args: [],
+    })
+    await webdriver('POST', `/session/${sessionId}/refresh`, {})
+    await waitForAuthenticatedCycle(desktopLog, 3, 'closed and reopened native WebView authentication')
+    await assertSingleTokenExchange(desktopLog)
+
+    const reopenedSurface = await waitFor(async () => {
+      const candidate = await find('css selector', '[data-testid="harness-native-surface"]')
+      return await attribute(candidate, 'data-loaded') === 'true' ? candidate : undefined
+    }, 'reopened authenticated native surface')
+    const reopenedBounds = await surfaceBounds(reopenedSurface)
+    assert.ok(
+      reopenedBounds.width > 500 && reopenedBounds.height > 300,
+      `unexpected reopened bounds: ${JSON.stringify(reopenedBounds)}`,
+    )
   }
   finally {
     if (sessionId !== undefined)

@@ -83,7 +83,10 @@ describe('local core E2E fixture', () => {
       'utf8',
     )
     const sessionCreated = source.indexOf('sessionId = session.sessionId')
-    const probeEvidence = source.indexOf('[harness-webview] protected probe completed: status=200')
+    const probeEvidence = source.indexOf(
+      '[harness-webview] protected probe completed: status=200',
+      sessionCreated,
+    )
     const firstElementPoll = source.indexOf('let surface')
     expect(sessionCreated).toBeGreaterThan(-1)
     expect(probeEvidence).toBeGreaterThan(sessionCreated)
@@ -176,5 +179,27 @@ describe('local core E2E fixture', () => {
     expect(authenticated.status).toBe(204)
     await waitForOutput(() => output.includes('E2E fixture child script executed'))
     expect(output).toContain('E2E fixture child script executed')
+  })
+
+  it('rejects a second use of the one-shot authentication token', async () => {
+    const port = await reservePort()
+    const child = spawn(process.execPath, [fileURLToPath(fixture), '--port', String(port)], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    fixtureProcesses.push(child)
+    let output = ''
+    child.stdout?.on('data', chunk => output += chunk.toString())
+    await waitForFixture(port)
+
+    const tokenUrl = `http://127.0.0.1:${port}/?token=E2E_ONE_SHOT_TOKEN`
+    const first = await fetch(tokenUrl, { redirect: 'manual' })
+    const second = await fetch(tokenUrl, { redirect: 'manual' })
+
+    expect(first.status).toBe(303)
+    expect(first.headers.get('set-cookie')).toContain('dsh-e2e=signed')
+    expect(second.status).toBe(401)
+    expect(second.headers.get('set-cookie')).toBeNull()
+    await waitForOutput(() => output.includes('E2E fixture rejected reused auth token'))
+    expect(output.match(/E2E fixture auth exchange request/g)).toHaveLength(1)
   })
 })

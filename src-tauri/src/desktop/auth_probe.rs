@@ -28,7 +28,14 @@ pub(crate) const AUTH_PROBE_JS: &str = r#"(function () {
 pub(crate) const AUTH_TOP_LEVEL_PROBE_JS: &str = r#"(function () {
   if (window.top !== window) return;
   if (location.protocol !== 'http:' || location.hostname !== '127.0.0.1') return;
-  if (location.search !== '' || sessionStorage.getItem('dsh-desktop-auth-probed') === '1') return;
+  if (location.search !== '') {
+    var params = new URLSearchParams(location.search);
+    var timestamps = params.getAll('t');
+    if (Array.from(params.keys()).some(function (name) { return name !== 't'; })
+      || timestamps.length !== 1
+      || !/^\d+$/.test(timestamps[0])) return;
+  }
+  if (sessionStorage.getItem('dsh-desktop-auth-probed') === '1') return;
   sessionStorage.setItem('dsh-desktop-auth-probed', '1');
   var body = JSON.stringify({
     type: 'client-request',
@@ -61,5 +68,9 @@ mod tests {
         assert!(AUTH_PROBE_JS.contains("location.hostname !== '127.0.0.1'"));
         assert!(AUTH_TOP_LEVEL_PROBE_JS.contains("window.top !== window"));
         assert!(AUTH_TOP_LEVEL_PROBE_JS.contains("dsh-auth-probe://127.0.0.1/"));
+        assert!(AUTH_TOP_LEVEL_PROBE_JS.contains("name !== 't'"));
+        assert!(AUTH_TOP_LEVEL_PROBE_JS.contains("timestamps.length !== 1"));
+        assert!(AUTH_TOP_LEVEL_PROBE_JS.contains(r"!/^\d+$/"));
+        assert!(!AUTH_TOP_LEVEL_PROBE_JS.contains("location.search !== '' ||"));
     }
 }
