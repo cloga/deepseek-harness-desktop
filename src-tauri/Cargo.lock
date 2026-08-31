@@ -4771,7 +4771,7 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-wdio-webdriver"
 version = "1.3.0"
-source = "git+https://github.com/cloga/desktop-mobile?rev=72fa371ff155dc1d09ddb2c404ebed6e879d72b8#72fa371ff155dc1d09ddb2c404ebed6e879d72b8"
+source = "git+https://github.com/cloga/desktop-mobile?rev=5b9be7469b8efc527631b89b3f7da7badfbfc544#5b9be7469b8efc527631b89b3f7da7badfbfc544"
 dependencies = [
  "async-trait",
  "axum",

@@ -36,7 +36,7 @@ tauri-plugin-store = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
-tauri-plugin-wdio-webdriver = { git = "https://github.com/cloga/desktop-mobile", rev = "72fa371ff155dc1d09ddb2c404ebed6e879d72b8", optional = true }
+tauri-plugin-wdio-webdriver = { git = "https://github.com/cloga/desktop-mobile", rev = "5b9be7469b8efc527631b89b3f7da7badfbfc544", optional = true }
 image = { version = "0.25", default-features = false, features = [ "png" ] }
 arboard = { version = "3", features = [ "wayland-data-control" ] }
 base64 = "0.22"
