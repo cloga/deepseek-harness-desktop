@@ -11,7 +11,7 @@ function runShellScenario(done) {
   function sleep(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds))
   }
-  async function waitForValue(callback, label, timeout = 90_000) {
+  async function waitForValue(callback, label, timeout = 25_000) {
     const deadline = Date.now() + timeout
     let lastError
     while (Date.now() < deadline) {
@@ -137,7 +137,8 @@ async function main() {
       async () => webdriver('POST', '/session', {
         capabilities: {
           alwaysMatch: {
-            browserName: 'wry',
+            'browserName': 'wry',
+            'wdio:tauriServiceOptions': { windowLabel: 'main' },
           },
         },
       }),
@@ -146,7 +147,6 @@ async function main() {
       error => error instanceof TypeError,
     )
     sessionId = session.sessionId
-    await webdriver('POST', `/session/${sessionId}/timeouts`, { script: 120_000 })
     const scenario = await webdriver(
       'POST',
       `/session/${sessionId}/execute/async`,
@@ -166,6 +166,7 @@ async function main() {
       return log.includes('Starting Harness process:')
         && log.includes('E2E fixture protected request authenticated=true')
         && log.includes('E2E fixture authenticated root document')
+        && log.includes('E2E fixture child script executed')
     }, 'natural local core startup evidence')
   }
   finally {

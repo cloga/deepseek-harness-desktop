@@ -1,5 +1,6 @@
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,6 +20,7 @@ const pluginNames = [
   'dsh-tauri-rightclick',
 ]
 const tempDirs: string[] = []
+const fixtureProcesses: ReturnType<typeof spawn>[] = []
 
 function fnv1a(bytes: Uint8Array): string {
   let hash = 0xCBF2_9CE4_8422_2325n
@@ -27,7 +29,49 @@ function fnv1a(bytes: Uint8Array): string {
   return hash.toString(16).padStart(16, '0')
 }
 
+function reservePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer()
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      if (typeof address === 'string' || address === null) {
+        server.close()
+        reject(new Error('fixture port was not assigned'))
+        return
+      }
+      server.close(error => error ? reject(error) : resolve(address.port))
+    })
+  })
+}
+
+async function waitForFixture(port: number): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/`)
+      return
+    }
+    catch {
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+  }
+  throw new Error('fixture server did not start')
+}
+
+async function waitForOutput(callback: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2_000
+  while (Date.now() < deadline) {
+    if (callback())
+      return
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error('fixture output did not arrive')
+}
+
 afterEach(() => {
+  for (const process of fixtureProcesses.splice(0))
+    process.kill()
   for (const path of tempDirs.splice(0))
     rmSync(path, { recursive: true, force: true })
 })
@@ -89,5 +133,35 @@ describe('local core E2E fixture', () => {
       )
       expect(manifest).toMatchObject({ name, version: '0.0.0-e2e' })
     }
+  })
+
+  it('records child script execution only for an authenticated request', async () => {
+    const port = await reservePort()
+    const child = spawn(process.execPath, [fileURLToPath(fixture), '--port', String(port)], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    fixtureProcesses.push(child)
+    let output = ''
+    child.stdout?.on('data', chunk => output += chunk.toString())
+    await waitForFixture(port)
+
+    const anonymous = await fetch(`http://127.0.0.1:${port}/e2e-rendered`, { method: 'POST' })
+    expect(anonymous.status).toBe(401)
+    expect(output).not.toContain('E2E fixture child script executed')
+
+    const exchange = await fetch(`http://127.0.0.1:${port}/?token=E2E_ONE_SHOT_TOKEN`, {
+      redirect: 'manual',
+    })
+    const cookie = exchange.headers.get('set-cookie')?.split(';')[0]
+    expect(cookie).toBe('dsh-e2e=signed')
+    if (cookie === undefined)
+      throw new Error('fixture auth cookie missing')
+    const authenticated = await fetch(`http://127.0.0.1:${port}/e2e-rendered`, {
+      method: 'POST',
+      headers: { cookie },
+    })
+    expect(authenticated.status).toBe(204)
+    await waitForOutput(() => output.includes('E2E fixture child script executed'))
+    expect(output).toContain('E2E fixture child script executed')
   })
 })
