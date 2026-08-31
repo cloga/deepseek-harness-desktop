@@ -74,6 +74,12 @@ let pluginActivityReason = ''
 const restartFlight = new SingleFlight<void>()
 const iframeReloadGate = new BoundedReloadGate(3)
 let iframeRefreshTimer: ReturnType<typeof setTimeout> | undefined
+let iframeAuthProbe: {
+  origin: string
+  resolve: () => void
+  reject: (error: Error) => void
+  timer: ReturnType<typeof setTimeout>
+} | undefined
 
 /** 构建带时间戳的 iframe URL，避免 WebView2 缓存旧页面。 */
 function generateTimestampedUrl(baseUrl: string): string {
@@ -84,6 +90,38 @@ function generateTimestampedUrl(baseUrl: string): string {
 
 interface HarnessRuntimeInfo {
   service_url: string
+}
+
+interface HarnessWebviewPreparation {
+  url: string
+  verify_auth: boolean
+}
+
+function waitForIframeAuthProbe(origin: string): Promise<void> {
+  if (iframeAuthProbe !== undefined) {
+    clearTimeout(iframeAuthProbe.timer)
+    iframeAuthProbe.reject(new Error('HARNESS_IFRAME_AUTH_REPLACED: newer iframe replaced probe'))
+  }
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (iframeAuthProbe?.timer === timer)
+        iframeAuthProbe = undefined
+      reject(new Error('HARNESS_IFRAME_AUTH_TIMEOUT: protected API probe did not respond'))
+    }, 15000)
+    iframeAuthProbe = { origin, resolve, reject, timer }
+  })
+}
+
+function settleIframeAuthProbe(origin: string, status: number) {
+  const probe = iframeAuthProbe
+  if (probe === undefined || probe.origin !== origin)
+    return
+  clearTimeout(probe.timer)
+  iframeAuthProbe = undefined
+  if (status === 200)
+    probe.resolve()
+  else
+    probe.reject(new Error(`HARNESS_IFRAME_AUTH_REJECTED: protected API returned ${status}`))
 }
 
 /** 通过 Rust 代理探测服务健康状态（超时 8s，网络抖动时重试） */
@@ -501,13 +539,28 @@ export const harness = defineStore({
       }
 
       const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
-      const iframeUrl = await invoke<string>('prepare_harness_webview', { generation: launchGeneration })
+      const preparation = await invoke<HarnessWebviewPreparation>('prepare_harness_webview', { generation: launchGeneration })
       if (token !== bootToken)
         return false
 
       this.serviceUrl = readyInfo.service_url
-      this.iframeSrc = generateTimestampedUrl(iframeUrl)
+      const authProbe = preparation.verify_auth
+        ? waitForIframeAuthProbe(new URL(preparation.url).origin)
+        : undefined
+      this.iframeSrc = generateTimestampedUrl(preparation.url)
       this.serviceHealthy = true
+      if (authProbe !== undefined) {
+        try {
+          await authProbe
+        }
+        catch (error) {
+          this.serviceHealthy = false
+          this.iframeLoaded = false
+          throw error
+        }
+      }
+      if (token !== bootToken)
+        return false
       this.serviceRunning = true
       this.status = 'ready'
       this.errorMsg = ''
@@ -534,6 +587,10 @@ export const harness = defineStore({
       void queryClient.invalidateQueries({ queryKey: ['profiles'] })
       void queryClient.invalidateQueries({ queryKey: ['cores'] })
       return true
+    },
+
+    reportIframeAuthProbe(origin: string, status: number) {
+      settleIframeAuthProbe(origin, status)
     },
 
     /** 拉起服务并等待健康检查通过，通过后才允许挂载 iframe */

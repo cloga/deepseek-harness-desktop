@@ -330,6 +330,7 @@ pub fn enable_notification_permissions(
                     crate::desktop::style::IFRAME_STYLES_JS,
                     crate::desktop::paste::PASTE_SHIM_JS,
                     crate::desktop::plugin_boot::PLUGIN_BOOT_RELOAD_JS,
+                    crate::desktop::auth_probe::AUTH_PROBE_JS,
                     crate::desktop::zoom::ZOOM_SHORTCUT_BRIDGE_JS,
                 ] {
                     let script = HSTRING::from(script);

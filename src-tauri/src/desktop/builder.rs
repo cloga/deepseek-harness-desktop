@@ -420,6 +420,7 @@ pub fn build_main_window(app: &tauri::AppHandle<Wry>) -> tauri::Result<tauri::We
         .initialization_script_for_all_frames(crate::desktop::style::IFRAME_STYLES_JS)
         .initialization_script_for_all_frames(crate::desktop::paste::PASTE_SHIM_JS)
         .initialization_script_for_all_frames(crate::desktop::plugin_boot::PLUGIN_BOOT_RELOAD_JS)
+        .initialization_script_for_all_frames(crate::desktop::auth_probe::AUTH_PROBE_JS)
         .initialization_script_for_all_frames(crate::desktop::zoom::ZOOM_SHORTCUT_BRIDGE_JS);
 
     let webview_window = webview_builder.build()?;

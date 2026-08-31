@@ -20,7 +20,28 @@ struct HarnessLaunchOwner {
     pid: Option<u32>,
     url: Option<String>,
     authenticated_port: Option<u16>,
-    pending: bool,
+    webview_pending: bool,
+    browser_pending: bool,
+    in_flight: Option<HarnessLaunchConsumer>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HarnessLaunchConsumer {
+    Webview,
+    Browser,
+}
+
+pub struct HarnessLaunchClaim {
+    generation: u64,
+    pid: u32,
+    url: String,
+    consumer: HarnessLaunchConsumer,
+}
+
+impl HarnessLaunchClaim {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
 }
 
 fn dsh_log_lock() -> &'static Mutex<()> {
@@ -44,7 +65,9 @@ pub fn begin_harness_launch_generation() -> u64 {
         pid: None,
         url: None,
         authenticated_port: None,
-        pending: false,
+        webview_pending: false,
+        browser_pending: false,
+        in_flight: None,
     });
     generation
 }
@@ -105,22 +128,90 @@ pub fn has_authenticated_harness_launch(port: u16) -> bool {
         .is_some_and(|owner| owner.authenticated_port == Some(port))
 }
 
-/// 仅向首次挂载的 WebView 交付一次认证 URL。
-pub fn take_harness_launch_url(port: u16, generation: u64) -> Option<String> {
+fn claim_harness_launch(
+    port: u16,
+    generation: Option<u64>,
+    consumer: HarnessLaunchConsumer,
+) -> Result<Option<HarnessLaunchClaim>, String> {
     let mut state = harness_launch_state()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let owner = state.owner.as_mut()?;
-    if owner.generation != generation || owner.pid.is_none() || !owner.pending {
-        return None;
+    let Some(owner) = state.owner.as_mut() else {
+        return Ok(None);
+    };
+    if generation.is_some_and(|generation| owner.generation != generation) {
+        return Err("HARNESS_AUTH_OWNER_MISMATCH: stale launch generation".into());
     }
-    let value = owner.url.as_ref()?;
-    let parsed = reqwest::Url::parse(&value).ok()?;
+    let Some(pid) = owner.pid else {
+        return Err("HARNESS_AUTH_OWNER_UNBOUND: launch process is not bound".into());
+    };
+    let pending = match consumer {
+        HarnessLaunchConsumer::Webview => owner.webview_pending,
+        HarnessLaunchConsumer::Browser => owner.browser_pending,
+    };
+    if !pending {
+        return if owner.authenticated_port.is_none() {
+            Ok(None)
+        } else {
+            Err("HARNESS_AUTH_HANDOFF_USED: authentication handoff was already used".into())
+        };
+    }
+    if owner.in_flight.is_some() {
+        return Err("HARNESS_AUTH_HANDOFF_BUSY: another authentication delivery is active".into());
+    }
+    let Some(value) = owner.url.as_ref() else {
+        return Ok(None);
+    };
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|_| "HARNESS_AUTH_URL_INVALID: captured launch URL is invalid".to_string())?;
     if parsed.host_str() != Some("127.0.0.1") || parsed.port_or_known_default() != Some(port) {
-        return None;
+        return Err("HARNESS_AUTH_PORT_MISMATCH: launch URL does not match active port".into());
     }
-    owner.pending = false;
-    owner.url.take()
+    owner.in_flight = Some(consumer);
+    Ok(Some(HarnessLaunchClaim {
+        generation: owner.generation,
+        pid,
+        url: value.clone(),
+        consumer,
+    }))
+}
+
+pub fn claim_harness_webview_launch(
+    port: u16,
+    generation: u64,
+) -> Result<Option<HarnessLaunchClaim>, String> {
+    claim_harness_launch(port, Some(generation), HarnessLaunchConsumer::Webview)
+}
+
+pub fn claim_harness_browser_launch(port: u16) -> Result<Option<HarnessLaunchClaim>, String> {
+    claim_harness_launch(port, None, HarnessLaunchConsumer::Browser)
+}
+
+/// 成功后才消费交付权；失败释放 claim，允许同一 generation/PID 安全重试。
+pub fn finish_harness_launch_claim(claim: &HarnessLaunchClaim, success: bool) -> bool {
+    let mut state = harness_launch_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(owner) = state.owner.as_mut() else {
+        return false;
+    };
+    if owner.generation != claim.generation
+        || owner.pid != Some(claim.pid)
+        || owner.in_flight != Some(claim.consumer)
+    {
+        return false;
+    }
+    owner.in_flight = None;
+    if success {
+        match claim.consumer {
+            HarnessLaunchConsumer::Webview => owner.webview_pending = false,
+            HarnessLaunchConsumer::Browser => owner.browser_pending = false,
+        }
+        if !owner.webview_pending && !owner.browser_pending {
+            owner.url = None;
+        }
+    }
+    true
 }
 
 /// 捕获 dsh 公布的一次性浏览器认证 URL，并返回适合写日志的脱敏文本。
@@ -154,7 +245,9 @@ fn capture_and_redact_launch_url(line: &str, generation: u64, pid: u32) -> Strin
         if owner.generation == generation && owner.pid == Some(pid) {
             owner.url = Some(candidate.to_string());
             owner.authenticated_port = parsed.port_or_known_default();
-            owner.pending = true;
+            owner.webview_pending = true;
+            owner.browser_pending = true;
+            owner.in_flight = None;
         }
     }
     drop(state);
@@ -682,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_launch_url_is_captured_redacted_and_taken_once() {
+    fn authenticated_launch_url_is_claimed_and_finalized_once_per_consumer() {
         let _guard = launch_url_test_guard();
         clear_harness_launch_url();
         let generation = begin_harness_launch_generation();
@@ -694,11 +787,17 @@ mod tests {
         );
         assert_eq!(safe, "dsh web: http://127.0.0.1:3083/?token=%3Credacted%3E");
         assert!(has_authenticated_harness_launch(3083));
-        assert_eq!(
-            take_harness_launch_url(3083, generation).as_deref(),
-            Some("http://127.0.0.1:3083/?token=secret-value")
-        );
-        assert_eq!(take_harness_launch_url(3083, generation), None);
+        let webview = claim_harness_webview_launch(3083, generation)
+            .unwrap()
+            .expect("webview claim");
+        assert_eq!(webview.url(), "http://127.0.0.1:3083/?token=secret-value");
+        assert!(finish_harness_launch_claim(&webview, true));
+        assert!(claim_harness_webview_launch(3083, generation).is_err());
+        let browser = claim_harness_browser_launch(3083)
+            .unwrap()
+            .expect("browser claim");
+        assert!(finish_harness_launch_claim(&browser, true));
+        assert!(claim_harness_browser_launch(3083).is_err());
         assert!(!has_authenticated_harness_launch(3080));
         clear_harness_launch_url();
     }
@@ -714,12 +813,56 @@ mod tests {
             generation,
             43,
         );
-        assert_eq!(take_harness_launch_url(3084, generation), None);
-        assert_eq!(
-            take_harness_launch_url(3083, generation.saturating_sub(1)),
-            None
+        assert!(claim_harness_webview_launch(3084, generation).is_err());
+        assert!(claim_harness_webview_launch(3083, generation.saturating_sub(1)).is_err());
+        assert!(claim_harness_webview_launch(3083, generation)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn failed_delivery_releases_claim_for_retry() {
+        let _guard = launch_url_test_guard();
+        clear_harness_launch_url();
+        let generation = begin_harness_launch_generation();
+        assert!(bind_harness_launch_process(generation, 44));
+        capture_and_redact_launch_url(
+            "dsh web: http://127.0.0.1:3083/?token=retry",
+            generation,
+            44,
         );
-        assert!(take_harness_launch_url(3083, generation).is_some());
+        let first = claim_harness_webview_launch(3083, generation)
+            .unwrap()
+            .expect("first claim");
+        assert!(finish_harness_launch_claim(&first, false));
+        let retry = claim_harness_webview_launch(3083, generation)
+            .unwrap()
+            .expect("retry claim");
+        assert_eq!(retry.url(), first.url());
+        assert!(finish_harness_launch_claim(&retry, true));
+    }
+
+    #[test]
+    fn stale_pid_claim_cannot_finalize_replacement_owner() {
+        let _guard = launch_url_test_guard();
+        clear_harness_launch_url();
+        let old_generation = begin_harness_launch_generation();
+        assert!(bind_harness_launch_process(old_generation, 45));
+        capture_and_redact_launch_url(
+            "dsh web: http://127.0.0.1:3083/?token=old",
+            old_generation,
+            45,
+        );
+        let stale = claim_harness_webview_launch(3083, old_generation)
+            .unwrap()
+            .expect("stale claim");
+        let replacement_generation = begin_harness_launch_generation();
+        assert!(bind_harness_launch_process(replacement_generation, 46));
+        assert!(!finish_harness_launch_claim(&stale, true));
+        assert_eq!(
+            current_harness_launch_generation(),
+            Some(replacement_generation)
+        );
     }
 
     #[test]

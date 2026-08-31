@@ -7,6 +7,7 @@
 use crate::config;
 use crate::logger;
 use crate::service::core;
+use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
@@ -34,19 +35,42 @@ pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeIn
 }
 
 /// 用一次性 token 换取 HttpOnly Cookie 并注入宿主 WebView，token 不跨 IPC。
+#[derive(Serialize)]
+pub struct HarnessWebviewPreparation {
+    url: String,
+    verify_auth: bool,
+}
+
 #[tauri::command]
 pub async fn prepare_harness_webview(
     app_handle: AppHandle,
     generation: u64,
-) -> Result<String, String> {
+) -> Result<HarnessWebviewPreparation, String> {
     let port = config::get_store_dat_setting(&app_handle).port;
     let service_url = config::get_dsh_service_url(port);
-    let Some(launch_url) =
-        crate::service::workflow::utils::take_harness_launch_url(port, generation)
+    let Some(claim) =
+        crate::service::workflow::utils::claim_harness_webview_launch(port, generation)?
     else {
-        return Ok(service_url);
+        return Ok(HarnessWebviewPreparation {
+            url: service_url,
+            verify_auth: false,
+        });
     };
-    let (cookie, iframe_url) = exchange_harness_cookie(&launch_url).await?;
+    let result = prepare_claimed_harness_webview(&app_handle, &claim, &service_url).await;
+    let finished =
+        crate::service::workflow::utils::finish_harness_launch_claim(&claim, result.is_ok());
+    if !finished {
+        return Err("HARNESS_AUTH_OWNER_CHANGED: launch owner changed during delivery".into());
+    }
+    result
+}
+
+async fn prepare_claimed_harness_webview(
+    app_handle: &AppHandle,
+    claim: &crate::service::workflow::utils::HarnessLaunchClaim,
+    service_url: &str,
+) -> Result<HarnessWebviewPreparation, String> {
+    let (cookie, iframe_url) = exchange_harness_cookie(claim.url()).await?;
     let cookie_name = cookie.name().to_string();
     let window = app_handle
         .get_webview_window("main")
@@ -66,7 +90,10 @@ pub async fn prepare_harness_webview(
     {
         return Err("HARNESS_AUTH_COOKIE_NOT_STORED: WebView rejected session cookie".into());
     }
-    Ok(iframe_url)
+    Ok(HarnessWebviewPreparation {
+        url: iframe_url,
+        verify_auth: true,
+    })
 }
 
 /// 向核心提交一次性 token，仅接受 303 + HttpOnly Cookie 的完整交换结果。
@@ -91,7 +118,7 @@ async fn exchange_harness_cookie(
         .get(exchange_url.clone())
         .send()
         .await
-        .map_err(|error| format!("HARNESS_AUTH_EXCHANGE_FAILED: {error}"))?;
+        .map_err(|_| "HARNESS_AUTH_EXCHANGE_FAILED: loopback request failed".to_string())?;
     if response.status() != reqwest::StatusCode::SEE_OTHER {
         return Err(format!(
             "HARNESS_AUTH_EXCHANGE_REJECTED: expected 303, got {}",
@@ -132,11 +159,23 @@ async fn exchange_harness_cookie(
 #[tauri::command]
 pub async fn open_in_browser(app_handle: AppHandle) -> Result<(), String> {
     let port = config::get_store_dat_setting(&app_handle).port;
-    let url = config::get_dsh_service_url(port);
-    app_handle
+    let claim = crate::service::workflow::utils::claim_harness_browser_launch(port)?;
+    let url = claim
+        .as_ref()
+        .map(|claim| claim.url().to_string())
+        .unwrap_or_else(|| config::get_dsh_service_url(port));
+    let result = app_handle
         .opener()
         .open_url(url, None::<&str>)
-        .map_err(|e| e.to_string())
+        .map_err(|_| "HARNESS_BROWSER_OPEN_FAILED: system browser launch failed".to_string());
+    if let Some(claim) = claim {
+        if !crate::service::workflow::utils::finish_harness_launch_claim(&claim, result.is_ok()) {
+            return Err(
+                "HARNESS_AUTH_OWNER_CHANGED: launch owner changed during browser open".into(),
+            );
+        }
+    }
+    result
 }
 
 /// 复制 Harness 服务地址到剪贴板
@@ -445,6 +484,26 @@ mod tests {
         assert_eq!(cookie.secure(), Some(true));
         assert_eq!(iframe_url, format!("http://localhost:{}/", address.port()));
         server.join().expect("fixture server");
+    }
+
+    #[tokio::test]
+    async fn transport_error_never_contains_launch_token_or_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve fixture port");
+        let address = listener.local_addr().expect("fixture address");
+        drop(listener);
+        let launch_url = format!(
+            "http://127.0.0.1:{}/?token=SENTINEL_SECRET_TOKEN",
+            address.port()
+        );
+        let error = exchange_harness_cookie(&launch_url)
+            .await
+            .expect_err("closed port must fail");
+        assert!(!error.contains("SENTINEL_SECRET_TOKEN"));
+        assert!(!error.contains(&launch_url));
+        assert_eq!(
+            error,
+            "HARNESS_AUTH_EXCHANGE_FAILED: loopback request failed"
+        );
     }
 
     #[test]

@@ -103,7 +103,7 @@ describe('runtime exit store', () => {
         return finalRuntimeInfo
       }
       if (command === 'prepare_harness_webview')
-        return 'http://127.0.0.1:31415'
+        return { url: 'http://127.0.0.1:31415', verify_auth: false }
       if (command === 'proxy_health_check') {
         healthChecks++
         if (healthChecks <= 2)
@@ -137,7 +137,7 @@ describe('runtime exit store', () => {
       if (command === 'get_runtime_info')
         return { service_url: 'http://127.0.0.1:31415' }
       if (command === 'prepare_harness_webview')
-        return 'http://127.0.0.1:31415'
+        return { url: 'http://127.0.0.1:31415', verify_auth: false }
       if (command === 'proxy_health_check') {
         healthChecks++
         return healthChecks === 1 ? 'Healthy' : 'HARNESS_NOT_READY: transient response'
@@ -174,5 +174,28 @@ describe('runtime exit store', () => {
 
     expect(harness.serviceHealthy).toBe(false)
     expect(harness.serviceRunning).toBe(false)
+  })
+
+  it('commits ready only after the protected iframe API probe succeeds', async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === 'launch_harness')
+        return 4
+      if (command === 'get_runtime_info')
+        return { service_url: 'http://127.0.0.1:31415' }
+      if (command === 'proxy_health_check')
+        return 'Healthy'
+      if (command === 'prepare_harness_webview')
+        return { url: 'http://localhost:31415/', verify_auth: true }
+      throw new Error(`unexpected invoke: ${command}`)
+    })
+
+    const launch = harness.launchAndWait()
+    await vi.waitFor(() => expect(harness.iframeSrc).toContain('http://localhost:31415/'))
+    expect(harness.status).toBe('ready')
+    harness.reportIframeAuthProbe('http://localhost:31415', 200)
+    await launch
+
+    expect(harness.serviceHealthy).toBe(true)
+    expect(harness.serviceRunning).toBe(true)
   })
 })

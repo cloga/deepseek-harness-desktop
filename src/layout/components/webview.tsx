@@ -1,6 +1,6 @@
 /* eslint-disable react/dom-no-unsafe-iframe-sandbox */
 import { CircleExclamation } from '@gravity-ui/icons'
-import { useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
 import { useStore } from 'valtio-define'
@@ -42,6 +42,18 @@ export function Webview() {
 
   useDesktopZoom(iframeRef)
   useIframeShim(iframeRef)
+  useEffect(() => {
+    function handleAuthProbe(event: MessageEvent) {
+      if (event.source !== iframeRef.current?.contentWindow)
+        return
+      const payload = event.data as { type?: unknown, status?: unknown }
+      if (payload?.type !== 'dsh://auth-probe' || typeof payload.status !== 'number')
+        return
+      store.harness.reportIframeAuthProbe(event.origin, payload.status)
+    }
+    window.addEventListener('message', handleAuthProbe)
+    return () => window.removeEventListener('message', handleAuthProbe)
+  }, [])
 
   if (status === 'error') {
     return (

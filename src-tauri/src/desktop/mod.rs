@@ -12,3 +12,4 @@ pub mod zoom;
 
 pub use builder::{builder, handler, setup, tray};
 pub use notification::show_native_notification;
+pub(crate) mod auth_probe;
