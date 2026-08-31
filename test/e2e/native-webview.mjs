@@ -7,7 +7,7 @@ const endpoint = 'http://127.0.0.1:4444'
 const application = process.env.DSH_E2E_APPLICATION
 let sessionId
 
-function runShellScenario(done) {
+function runShellScenario(callbackUrl) {
   const scenarioDeadline = Date.now() + 25_000
   function sleep(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds))
@@ -90,13 +90,20 @@ function runShellScenario(done) {
     await waitForValue(() => bounds(surface).width === full.width, 'Settings bounds restore')
     return { full, helpBounds, restored: bounds(surface) }
   }
+  function report(payload) {
+    return fetch(callbackUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: JSON.stringify(payload),
+    })
+  }
   run().then(
-    value => done({ value }),
-    error => done({ error: error instanceof Error ? error.stack : String(error) }),
+    value => report({ value }),
+    error => report({ error: error instanceof Error ? error.stack : String(error) }),
   )
 }
 
-const shellScenario = `(${runShellScenario})(arguments[arguments.length - 1])`
+const shellScenario = `return (${runShellScenario})(arguments[0])`
 
 async function webdriver(method, path, body) {
   const response = await fetch(`${endpoint}${path}`, {
@@ -147,11 +154,16 @@ async function main() {
       error => error instanceof TypeError,
     )
     sessionId = session.sessionId
-    const scenario = await webdriver(
+    const callbackUrl = 'http://127.0.0.1:3081/e2e-shell-result'
+    await webdriver(
       'POST',
-      `/session/${sessionId}/execute/async`,
-      { script: shellScenario, args: [] },
+      `/session/${sessionId}/execute/sync`,
+      { script: shellScenario, args: [callbackUrl] },
     )
+    const scenario = await waitFor(async () => {
+      const response = await fetch(callbackUrl)
+      return response.ok ? response.json() : undefined
+    }, 'shell scenario result', 35_000)
     assert.equal(scenario.error, undefined, scenario.error)
     assert.ok(scenario.value.full.width > 500)
     assert.equal(scenario.value.restored.width, scenario.value.full.width)
