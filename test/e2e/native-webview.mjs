@@ -7,132 +7,6 @@ const endpoint = 'http://127.0.0.1:4444'
 const application = process.env.DSH_E2E_APPLICATION
 let sessionId
 
-function runShellScenario(callbackUrl, surface) {
-  const scenarioDeadline = Date.now() + 20_000
-  function sleep(milliseconds) {
-    return new Promise(resolve => setTimeout(resolve, milliseconds))
-  }
-  async function waitForValue(callback, label) {
-    let lastError
-    while (Date.now() < scenarioDeadline) {
-      try {
-        const value = callback()
-        if (value)
-          return value
-      }
-      catch (error) {
-        lastError = error
-      }
-      await sleep(100)
-    }
-    throw new Error(`Timed out waiting for ${label}: ${lastError || 'condition not met'}`)
-  }
-  function byText(selector, text) {
-    return Array.from(globalThis.document.querySelectorAll(selector))
-      .find(element => element.textContent.trim() === text)
-  }
-  function bounds(surface) {
-    return {
-      x: Number(surface.dataset.nativeX),
-      y: Number(surface.dataset.nativeY),
-      width: Number(surface.dataset.nativeWidth),
-      height: Number(surface.dataset.nativeHeight),
-    }
-  }
-
-  async function run() {
-    const full = bounds(surface)
-    if (!(full.width > 500 && full.height > 300))
-      throw new Error(`unexpected initial bounds: ${JSON.stringify(full)}`)
-
-    const help = await waitForValue(() => byText('button', '帮助'), 'Help button')
-    help.click()
-    const helpBounds = await waitForValue(() => {
-      const current = bounds(surface)
-      return current.height < full.height ? current : undefined
-    }, 'Help overlay crop')
-    if (!(helpBounds.width > 500 && helpBounds.height > 100))
-      throw new Error('Help must not hide the main surface')
-
-    const logs = await waitForValue(
-      () => byText('[role="menuitem"]', '运行日志'),
-      'Run Logs menu item',
-    )
-    logs.click()
-    await waitForValue(() => globalThis.document.querySelector('[data-slot="toast"]'), 'toast')
-    await waitForValue(() => {
-      const current = bounds(surface)
-      return current.height < full.height ? current : undefined
-    }, 'toast overlay crop')
-    const toastClose = await waitForValue(
-      () => globalThis.document.querySelector('[data-slot="toast-close"]'),
-      'toast close button',
-    )
-    toastClose.click()
-    await waitForValue(() => bounds(surface).height === full.height, 'Help bounds restore')
-
-    const settings = await waitForValue(() => byText('button', '配置'), 'Settings button')
-    settings.click()
-    await waitForValue(
-      () => globalThis.document.querySelector('[data-slot="modal-backdrop"]'),
-      'Settings modal',
-    )
-    await waitForValue(() => bounds(surface).width === 1, 'Settings modal offscreen bounds')
-    const close = await waitForValue(
-      () => globalThis.document.querySelector('[data-slot="modal-close-trigger"]'),
-      'Settings close button',
-    )
-    close.click()
-    await waitForValue(() => bounds(surface).width === full.width, 'Settings bounds restore')
-    return { full, helpBounds, restored: bounds(surface) }
-  }
-  function report(payload) {
-    return fetch(callbackUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'text/plain' },
-      body: JSON.stringify(payload),
-    })
-  }
-  run().then(
-    value => report({ value }),
-    error => report({ error: error instanceof Error ? error.stack : String(error) }),
-  )
-}
-
-function installShellScenario(callbackUrl, scenario) {
-  let started = false
-  let observer
-  function startWhenAuthenticated() {
-    if (started)
-      return
-    const surface = globalThis.document.querySelector('[data-testid="harness-native-surface"]')
-    if (surface?.dataset.loaded !== 'true')
-      return
-    started = true
-    observer.disconnect()
-    scenario(callbackUrl, surface)
-  }
-  observer = new globalThis.MutationObserver(startWhenAuthenticated)
-  observer.observe(globalThis.document.documentElement, {
-    attributes: true,
-    attributeFilter: ['data-loaded'],
-    childList: true,
-    subtree: true,
-  })
-  startWhenAuthenticated()
-}
-
-function shellBootstrap(callbackUrl) {
-  const pageScript = `(${installShellScenario})(${JSON.stringify(callbackUrl)}, ${runShellScenario})`
-  return `
-    const script = document.createElement('script')
-    script.textContent = ${JSON.stringify(pageScript)}
-    document.documentElement.appendChild(script)
-    script.remove()
-    return { started: true }
-  `
-}
-
 async function webdriver(method, path, body) {
   const response = await fetch(`${endpoint}${path}`, {
     method,
@@ -164,6 +38,27 @@ async function waitFor(callback, label, timeout = 60_000, shouldRetry = () => tr
   throw new Error(`Timed out waiting for ${label}: ${lastError ?? 'condition not met'}`)
 }
 
+async function find(using, value) {
+  return webdriver('POST', `/session/${sessionId}/element`, { using, value })
+}
+
+async function attribute(element, name) {
+  return webdriver('GET', `/session/${sessionId}/element/${element['element-6066-11e4-a52e-4f735466cecf']}/attribute/${name}`)
+}
+
+async function click(element) {
+  return webdriver('POST', `/session/${sessionId}/element/${element['element-6066-11e4-a52e-4f735466cecf']}/click`, {})
+}
+
+async function surfaceBounds(surface) {
+  return {
+    x: Number(await attribute(surface, 'data-native-x')),
+    y: Number(await attribute(surface, 'data-native-y')),
+    width: Number(await attribute(surface, 'data-native-width')),
+    height: Number(await attribute(surface, 'data-native-height')),
+  }
+}
+
 async function main() {
   try {
     assert.ok(application, 'DSH_E2E_APPLICATION is required')
@@ -182,20 +77,24 @@ async function main() {
       error => error instanceof TypeError,
     )
     sessionId = session.sessionId
-    const callbackUrl = 'http://127.0.0.1:3081/e2e-shell-result'
-    const bootstrap = await webdriver(
-      'POST',
-      `/session/${sessionId}/execute/sync`,
-      { script: shellBootstrap(callbackUrl), args: [] },
-    )
-    assert.equal(bootstrap.started, true)
-    const scenario = await waitFor(async () => {
-      const response = await fetch(callbackUrl)
-      return response.ok ? response.json() : undefined
-    }, 'shell scenario result', 35_000)
-    assert.equal(scenario.error, undefined, scenario.error)
-    assert.ok(scenario.value.full.width > 500)
-    assert.equal(scenario.value.restored.width, scenario.value.full.width)
+
+    let surface
+    try {
+      surface = await waitFor(async () => {
+        const candidate = await find('css selector', '[data-testid="harness-native-surface"]')
+        return await attribute(candidate, 'data-loaded') === 'true' ? candidate : undefined
+      }, 'authenticated native surface')
+    }
+    catch (error) {
+      const currentUrl = await webdriver('GET', `/session/${sessionId}/url`).catch(() => 'unavailable')
+      const title = await webdriver('GET', `/session/${sessionId}/title`).catch(() => 'unavailable')
+      const handles = await webdriver('GET', `/session/${sessionId}/window/handles`).catch(() => [])
+      throw new Error(
+        `${error instanceof Error ? error.message : error}; shell=${JSON.stringify({ currentUrl, title, handles })}`,
+      )
+    }
+    const full = await surfaceBounds(surface)
+    assert.ok(full.width > 500 && full.height > 300, `unexpected initial bounds: ${JSON.stringify(full)}`)
     const desktopLog = join(
       process.env.APPDATA,
       'io.github.hairyf.deepseek-harness-desktop',
@@ -209,6 +108,28 @@ async function main() {
         && log.includes('E2E fixture authenticated root document')
         && log.includes('E2E fixture child script executed')
     }, 'natural local core startup evidence')
+
+    const help = await find('xpath', '//button[normalize-space()="帮助"]')
+    await click(help)
+    await waitFor(async () => (await surfaceBounds(surface)).height < full.height, 'Help overlay crop')
+    const helpBounds = await surfaceBounds(surface)
+    assert.ok(helpBounds.width > 500 && helpBounds.height > 100, 'Help must not hide the main surface')
+
+    const logs = await find('xpath', '//*[@role="menuitem" and contains(.,"运行日志")]')
+    await click(logs)
+    await find('css selector', '[data-slot="toast"]')
+    await waitFor(async () => (await surfaceBounds(surface)).height < full.height, 'toast overlay crop')
+    const toastClose = await find('css selector', '[data-slot="toast-close"]')
+    await click(toastClose)
+    await waitFor(async () => (await surfaceBounds(surface)).height === full.height, 'Help bounds restore')
+
+    const settings = await find('xpath', '//button[normalize-space()="配置"]')
+    await click(settings)
+    await find('css selector', '[data-slot="modal-backdrop"]')
+    await waitFor(async () => (await surfaceBounds(surface)).width === 1, 'Settings modal offscreen bounds')
+    const close = await find('css selector', '[data-slot="modal-close-trigger"]')
+    await click(close)
+    await waitFor(async () => (await surfaceBounds(surface)).width === full.width, 'Settings bounds restore')
   }
   finally {
     if (sessionId !== undefined)

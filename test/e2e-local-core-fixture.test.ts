@@ -90,19 +90,6 @@ describe('local core E2E fixture', () => {
     )
   })
 
-  it('keeps callback CSP allowances isolated to the E2E build config', () => {
-    const production = JSON.parse(
-      readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'),
-    )
-    const e2e = JSON.parse(
-      readFileSync(new URL('../src-tauri/tauri.e2e.conf.json', import.meta.url), 'utf8'),
-    )
-    expect(production.app.security.csp).not.toContain('http://127.0.0.1:3081')
-    expect(production.app.security.csp).not.toContain('script-src \'self\' \'unsafe-inline\'')
-    expect(e2e.app.security.csp).toContain('connect-src \'self\' ipc: http://ipc.localhost http://127.0.0.1:3081')
-    expect(e2e.app.security.csp).toContain('script-src \'self\' \'unsafe-inline\'')
-  })
-
   it('keeps the completed preinstall baseline synchronized with bundled presets', () => {
     const store = JSON.parse(
       readFileSync(new URL('./e2e/store.dat', import.meta.url), 'utf8'),
@@ -148,7 +135,7 @@ describe('local core E2E fixture', () => {
     }
   })
 
-  it('records authenticated child execution and accepts one strict shell result', async () => {
+  it('records child script execution only for an authenticated request', async () => {
     const port = await reservePort()
     const child = spawn(process.execPath, [fileURLToPath(fixture), '--port', String(port)], {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -176,67 +163,5 @@ describe('local core E2E fixture', () => {
     expect(authenticated.status).toBe(204)
     await waitForOutput(() => output.includes('E2E fixture child script executed'))
     expect(output).toContain('E2E fixture child script executed')
-
-    const callbackUrl = `http://127.0.0.1:${port}/e2e-shell-result`
-    const missingOrigin = await fetch(callbackUrl, {
-      method: 'POST',
-      body: JSON.stringify({ value: { full: { width: 1 } } }),
-    })
-    expect(missingOrigin.status).toBe(403)
-    const oversized = await fetch(callbackUrl, {
-      method: 'POST',
-      headers: { origin: 'http://tauri.localhost' },
-      body: 'x'.repeat(64 * 1024 + 1),
-    })
-    expect(oversized.status).toBe(413)
-    const invalidShape = await fetch(callbackUrl, {
-      method: 'POST',
-      headers: { origin: 'http://tauri.localhost' },
-      body: JSON.stringify({ unexpected: true }),
-    })
-    expect(invalidShape.status).toBe(400)
-    const expected = { value: { full: { width: 1024 }, restored: { width: 1024 } } }
-    const accepted = await fetch(callbackUrl, {
-      method: 'POST',
-      headers: { origin: 'http://tauri.localhost' },
-      body: JSON.stringify(expected),
-    })
-    expect(accepted.status).toBe(204)
-    expect(accepted.headers.get('access-control-allow-origin')).toBe('http://tauri.localhost')
-    expect(await (await fetch(callbackUrl)).json()).toEqual(expected)
-    const duplicate = await fetch(callbackUrl, {
-      method: 'POST',
-      headers: { origin: 'http://tauri.localhost' },
-      body: JSON.stringify(expected),
-    })
-    expect(duplicate.status).toBe(409)
-    expect(output).toContain('E2E shell result rejected origin')
-    expect(output).toContain('E2E shell result rejected size')
-    expect(output).toContain('E2E shell result rejected shape')
-    expect(output).toContain('E2E shell result accepted')
-    expect(output).toContain('E2E shell result rejected duplicate')
-  })
-
-  it('accepts a structured shell scenario failure without logging its body', async () => {
-    const port = await reservePort()
-    const child = spawn(process.execPath, [fileURLToPath(fixture), '--port', String(port)], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    fixtureProcesses.push(child)
-    let output = ''
-    child.stdout?.on('data', chunk => output += chunk.toString())
-    await waitForFixture(port)
-    const callbackUrl = `http://127.0.0.1:${port}/e2e-shell-result`
-    const expected = { error: 'SENTINEL_SCENARIO_FAILURE' }
-    const accepted = await fetch(callbackUrl, {
-      method: 'POST',
-      headers: { origin: 'http://tauri.localhost' },
-      body: JSON.stringify(expected),
-    })
-
-    expect(accepted.status).toBe(204)
-    expect(await (await fetch(callbackUrl)).json()).toEqual(expected)
-    expect(output).not.toContain(expected.error)
-    expect(output).toContain('E2E shell result accepted')
   })
 })

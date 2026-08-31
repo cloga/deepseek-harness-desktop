@@ -151,7 +151,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build WebDriver-enabled desktop app
-        run: pnpm exec tauri build --debug --no-bundle --features webdriver --config src-tauri\tauri.e2e.conf.json
+        run: pnpm exec tauri build --debug --no-bundle --features webdriver
 
       - name: Prepare isolated desktop state
         shell: pwsh

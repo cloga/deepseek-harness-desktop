@@ -4771,8 +4771,7 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-wdio-webdriver"
 version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ad665bda48567107b6a3d070fe6d58a98e21f3ebf52abe41308fa4d5919f61b"
+source = "git+https://github.com/cloga/desktop-mobile?rev=72fa371ff155dc1d09ddb2c404ebed6e879d72b8#72fa371ff155dc1d09ddb2c404ebed6e879d72b8"
 dependencies = [
  "async-trait",
  "axum",
