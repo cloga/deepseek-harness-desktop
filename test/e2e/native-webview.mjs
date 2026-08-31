@@ -7,8 +7,8 @@ const endpoint = 'http://127.0.0.1:4444'
 const application = process.env.DSH_E2E_APPLICATION
 let sessionId
 
-function runShellScenario(callbackUrl) {
-  const scenarioDeadline = Date.now() + 25_000
+function runShellScenario(callbackUrl, surface) {
+  const scenarioDeadline = Date.now() + 20_000
   function sleep(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds))
   }
@@ -41,10 +41,6 @@ function runShellScenario(callbackUrl) {
   }
 
   async function run() {
-    const surface = await waitForValue(() => {
-      const candidate = globalThis.document.querySelector('[data-testid="harness-native-surface"]')
-      return candidate?.dataset.loaded === 'true' ? candidate : undefined
-    }, 'authenticated native surface')
     const full = bounds(surface)
     if (!(full.width > 500 && full.height > 300))
       throw new Error(`unexpected initial bounds: ${JSON.stringify(full)}`)
@@ -103,8 +99,31 @@ function runShellScenario(callbackUrl) {
   )
 }
 
+function installShellScenario(callbackUrl, scenario) {
+  let started = false
+  let observer
+  function startWhenAuthenticated() {
+    if (started)
+      return
+    const surface = globalThis.document.querySelector('[data-testid="harness-native-surface"]')
+    if (surface?.dataset.loaded !== 'true')
+      return
+    started = true
+    observer.disconnect()
+    scenario(callbackUrl, surface)
+  }
+  observer = new globalThis.MutationObserver(startWhenAuthenticated)
+  observer.observe(globalThis.document.documentElement, {
+    attributes: true,
+    attributeFilter: ['data-loaded'],
+    childList: true,
+    subtree: true,
+  })
+  startWhenAuthenticated()
+}
+
 function shellBootstrap(callbackUrl) {
-  const pageScript = `setTimeout(() => (${runShellScenario})(${JSON.stringify(callbackUrl)}), 250)`
+  const pageScript = `(${installShellScenario})(${JSON.stringify(callbackUrl)}, ${runShellScenario})`
   return `
     const script = document.createElement('script')
     script.textContent = ${JSON.stringify(pageScript)}
