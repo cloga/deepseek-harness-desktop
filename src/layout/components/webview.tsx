@@ -15,6 +15,7 @@ import {
   fitNativeWebviewAroundOverlays,
   floatingOverlayBounds,
   hasBlockingOverlay,
+  serializeNativeWebviewBounds,
   shouldShowNativeWebview,
 } from '@/utils/native-webview-visibility'
 import { Loadable } from './loadable'
@@ -88,12 +89,7 @@ export function Webview() {
       if (disposed || !nativeWebview || !serviceHealthy || element === null)
         return
       const bounds = element.getBoundingClientRect()
-      const geometry = {
-        x: bounds.x,
-        y: bounds.y,
-        width: bounds.width,
-        height: bounds.height,
-      }
+      const geometry = serializeNativeWebviewBounds(bounds)
       if (mounted || mounting)
         return
       mounting = true
@@ -146,12 +142,13 @@ export function Webview() {
       const bounds = next
         ? fitNativeWebviewAroundOverlays(base, floatingOverlayBounds(document))
         : { x: -1, y: -1, width: 1, height: 1 }
-      const state = JSON.stringify(bounds)
+      const serializedBounds = serializeNativeWebviewBounds(bounds)
+      const state = JSON.stringify(serializedBounds)
       if (state === lastState)
         return
       lastState = state
-      await invoke('set_harness_webview_bounds', { ...bounds })
-      store.harness.nativeWebviewBounds = bounds
+      await invoke('set_harness_webview_bounds', serializedBounds)
+      store.harness.nativeWebviewBounds = serializedBounds
     }
     function scheduleVisibilitySync() {
       syncQueue = syncQueue.then(syncVisibility).catch((error) => {

@@ -23,6 +23,20 @@ export interface NativeWebviewBounds {
   height: number
 }
 
+export function serializeNativeWebviewBounds(
+  bounds: NativeWebviewBounds,
+): NativeWebviewBounds & Record<string, unknown> {
+  const serialized: NativeWebviewBounds & Record<string, unknown> = {
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+  }
+  if (!Object.values(serialized).every(Number.isFinite))
+    throw new Error(`NATIVE_WEBVIEW_BOUNDS_INVALID: ${JSON.stringify(serialized)}`)
+  return serialized
+}
+
 export function hasBlockingOverlay(root: QueryRoot): boolean {
   return root.querySelector(BLOCKING_OVERLAY_SELECTOR) !== null
 }
@@ -36,24 +50,20 @@ export function fitNativeWebviewAroundOverlays(
   base: NativeWebviewBounds,
   overlays: NativeWebviewBounds[],
 ): NativeWebviewBounds {
-  let fitted = {
-    x: base.x,
-    y: base.y,
-    width: base.width,
-    height: base.height,
-  }
+  let fitted = serializeNativeWebviewBounds(base)
   for (const overlay of overlays) {
+    const safeOverlay = serializeNativeWebviewBounds(overlay)
     const right = fitted.x + fitted.width
     const bottom = fitted.y + fitted.height
-    const overlayRight = overlay.x + overlay.width
-    const overlayBottom = overlay.y + overlay.height
-    const intersects = overlay.x < right
+    const overlayRight = safeOverlay.x + safeOverlay.width
+    const overlayBottom = safeOverlay.y + safeOverlay.height
+    const intersects = safeOverlay.x < right
       && overlayRight > fitted.x
-      && overlay.y < bottom
+      && safeOverlay.y < bottom
       && overlayBottom > fitted.y
     if (!intersects)
       continue
-    const above = Math.max(0, overlay.y - fitted.y)
+    const above = Math.max(0, safeOverlay.y - fitted.y)
     const below = Math.max(0, bottom - overlayBottom)
     if (below >= above) {
       fitted = {
@@ -69,7 +79,7 @@ export function fitNativeWebviewAroundOverlays(
       }
     }
   }
-  return fitted
+  return serializeNativeWebviewBounds(fitted)
 }
 
 export function shouldShowNativeWebview(

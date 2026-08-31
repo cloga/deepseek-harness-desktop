@@ -3,6 +3,7 @@ import {
   fitNativeWebviewAroundOverlays,
   floatingOverlayBounds,
   hasBlockingOverlay,
+  serializeNativeWebviewBounds,
   shouldShowNativeWebview,
 } from '../src/utils/native-webview-visibility'
 
@@ -60,5 +61,33 @@ describe('native WebView visibility', () => {
     const fitted = fitNativeWebviewAroundOverlays(domRectLike, [])
     expect(fitted).toEqual(dimensions)
     expect(Object.keys(fitted)).toEqual(['x', 'y', 'width', 'height'])
+  })
+
+  it('serializes prototype-backed bounds into an exact plain invoke payload', () => {
+    const prototype = Object.defineProperties({}, {
+      x: { get: () => 12 },
+      y: { get: () => 44 },
+      width: { get: () => 960 },
+      height: { get: () => 720 },
+    })
+    expect(serializeNativeWebviewBounds(Object.create(prototype))).toEqual({
+      x: 12,
+      y: 44,
+      width: 960,
+      height: 720,
+    })
+  })
+
+  it('rejects non-finite bounds instead of invoking Tauri with invalid geometry', () => {
+    expect(() => serializeNativeWebviewBounds({
+      x: Number.NaN,
+      y: 44,
+      width: 960,
+      height: 720,
+    })).toThrow('NATIVE_WEBVIEW_BOUNDS_INVALID')
+    expect(() => fitNativeWebviewAroundOverlays(
+      { x: 0, y: 44, width: 960, height: 720 },
+      [{ x: 0, y: 0, width: Number.POSITIVE_INFINITY, height: 10 }],
+    )).toThrow('NATIVE_WEBVIEW_BOUNDS_INVALID')
   })
 })
