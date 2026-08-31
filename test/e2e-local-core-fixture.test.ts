@@ -77,6 +77,19 @@ afterEach(() => {
 })
 
 describe('local core E2E fixture', () => {
+  it('does not execute WebDriver scripts while the child is authenticating', () => {
+    const source = readFileSync(
+      new URL('./e2e/native-webview.mjs', import.meta.url),
+      'utf8',
+    )
+    const sessionCreated = source.indexOf('sessionId = session.sessionId')
+    const probeEvidence = source.indexOf('[harness-webview] protected probe completed: status=200')
+    const firstElementPoll = source.indexOf('let surface')
+    expect(sessionCreated).toBeGreaterThan(-1)
+    expect(probeEvidence).toBeGreaterThan(sessionCreated)
+    expect(firstElementPoll).toBeGreaterThan(probeEvidence)
+  })
+
   it('places the debug store at the Tauri app-data root', () => {
     const workflow = readFileSync(
       new URL('../.github/workflows/ci.yml', import.meta.url),

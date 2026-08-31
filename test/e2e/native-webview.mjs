@@ -78,6 +78,21 @@ async function main() {
     )
     sessionId = session.sessionId
 
+    const desktopLog = join(
+      process.env.APPDATA,
+      'io.github.hairyf.deepseek-harness-desktop',
+      'logs',
+      'desktop.log',
+    )
+    await waitFor(async () => {
+      const log = await readFile(desktopLog, 'utf8')
+      return log.includes('Starting Harness process:')
+        && log.includes('[harness-webview] protected probe completed: status=200')
+        && log.includes('E2E fixture protected request authenticated=true')
+        && log.includes('E2E fixture authenticated root document')
+        && log.includes('E2E fixture child script executed')
+    }, 'natural local core startup evidence')
+
     let surface
     try {
       surface = await waitFor(async () => {
@@ -95,19 +110,6 @@ async function main() {
     }
     const full = await surfaceBounds(surface)
     assert.ok(full.width > 500 && full.height > 300, `unexpected initial bounds: ${JSON.stringify(full)}`)
-    const desktopLog = join(
-      process.env.APPDATA,
-      'io.github.hairyf.deepseek-harness-desktop',
-      'logs',
-      'desktop.log',
-    )
-    await waitFor(async () => {
-      const log = await readFile(desktopLog, 'utf8')
-      return log.includes('Starting Harness process:')
-        && log.includes('E2E fixture protected request authenticated=true')
-        && log.includes('E2E fixture authenticated root document')
-        && log.includes('E2E fixture child script executed')
-    }, 'natural local core startup evidence')
 
     const help = await find('xpath', '//button[normalize-space()="帮助"]')
     await click(help)
