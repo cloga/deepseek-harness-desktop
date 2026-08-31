@@ -7,7 +7,7 @@ import {
 } from '../src/utils/native-webview-visibility'
 
 describe('native WebView visibility', () => {
-  it('keeps the child hidden until auth readiness and hides it behind overlays', () => {
+  it('keeps the child offscreen until auth readiness and behind full overlays', () => {
     expect(shouldShowNativeWebview(true, true, false, false)).toBe(false)
     expect(shouldShowNativeWebview(true, true, true, false)).toBe(true)
     expect(shouldShowNativeWebview(true, true, true, true)).toBe(false)

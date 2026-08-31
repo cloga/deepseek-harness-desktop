@@ -168,6 +168,9 @@ pub async fn mount_harness_webview(
     width: f64,
     height: f64,
 ) -> Result<(), String> {
+    if ![x, y, width, height].iter().all(|value| value.is_finite()) {
+        return Err("HARNESS_WEBVIEW_BOUNDS_INVALID: child WebView bounds are invalid".into());
+    }
     let relay_url = reqwest::Url::parse(&url)
         .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?;
     if relay_url.scheme() != "http"
@@ -236,13 +239,10 @@ pub async fn mount_harness_webview(
     let webview = window
         .add_child(
             builder,
-            tauri::LogicalPosition::new(x, y),
-            tauri::LogicalSize::new(width.max(1.0), height.max(1.0)),
+            tauri::LogicalPosition::new(-1.0, -1.0),
+            tauri::LogicalSize::new(1.0, 1.0),
         )
         .map_err(|_| "HARNESS_WEBVIEW_CREATE_FAILED: child WebView creation failed".to_string())?;
-    webview
-        .hide()
-        .map_err(|_| "HARNESS_WEBVIEW_HIDE_FAILED: child WebView hide failed".to_string())?;
     webview
         .navigate(destination)
         .map_err(|_| "HARNESS_WEBVIEW_NAVIGATE_FAILED: child WebView navigation failed".to_string())
@@ -265,25 +265,6 @@ pub fn set_harness_webview_bounds(
             size: tauri::Size::Logical(tauri::LogicalSize::new(width.max(1.0), height.max(1.0))),
         })
         .map_err(|_| "HARNESS_WEBVIEW_BOUNDS_FAILED: child WebView resize failed".to_string())
-}
-
-#[tauri::command]
-pub fn show_harness_webview(app_handle: AppHandle) -> Result<(), String> {
-    app_handle
-        .get_webview("harness")
-        .ok_or_else(|| "HARNESS_WEBVIEW_MISSING: child WebView not found".to_string())?
-        .show()
-        .map_err(|_| "HARNESS_WEBVIEW_SHOW_FAILED: child WebView show failed".to_string())
-}
-
-#[tauri::command]
-pub fn hide_harness_webview(app_handle: AppHandle) -> Result<(), String> {
-    if let Some(webview) = app_handle.get_webview("harness") {
-        webview
-            .hide()
-            .map_err(|_| "HARNESS_WEBVIEW_HIDE_FAILED: child WebView hide failed".to_string())?;
-    }
-    Ok(())
 }
 
 #[tauri::command]

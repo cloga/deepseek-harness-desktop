@@ -126,10 +126,9 @@ export function Webview() {
   useEffect(() => {
     if (!nativeWebview)
       return
-    let revision = 0
     let lastState = ''
+    let syncQueue = Promise.resolve()
     async function syncVisibility() {
-      const currentRevision = ++revision
       const element = nativeWebviewRef.current
       if (element === null)
         return
@@ -140,21 +139,17 @@ export function Webview() {
         hasBlockingOverlay(document),
       )
       const base = element.getBoundingClientRect()
-      const bounds = fitNativeWebviewAroundOverlays(base, floatingOverlayBounds(document))
-      const state = JSON.stringify({ next, bounds })
+      const bounds = next
+        ? fitNativeWebviewAroundOverlays(base, floatingOverlayBounds(document))
+        : { x: -1, y: -1, width: 1, height: 1 }
+      const state = JSON.stringify(bounds)
       if (state === lastState)
         return
       lastState = state
-      if (!next) {
-        await invoke('hide_harness_webview')
-        return
-      }
       await invoke('set_harness_webview_bounds', { ...bounds })
-      if (currentRevision === revision)
-        await invoke('show_harness_webview')
     }
     function scheduleVisibilitySync() {
-      void syncVisibility().catch((error) => {
+      syncQueue = syncQueue.then(syncVisibility).catch((error) => {
         console.error('[Harness] failed to synchronize native WebView visibility:', error)
       })
     }
@@ -169,7 +164,6 @@ export function Webview() {
       resizeObserver.observe(nativeWebviewRef.current)
     scheduleVisibilitySync()
     return () => {
-      revision++
       mutationObserver.disconnect()
       resizeObserver.disconnect()
     }

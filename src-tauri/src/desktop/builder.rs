@@ -545,8 +545,6 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::bridge::finish_harness_webview_auth,
         crate::bridge::mount_harness_webview,
         crate::bridge::set_harness_webview_bounds,
-        crate::bridge::show_harness_webview,
-        crate::bridge::hide_harness_webview,
         crate::bridge::close_harness_webview,
         crate::bridge::reload_harness_webview,
         crate::bridge::runtime_ready,
