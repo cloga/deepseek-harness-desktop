@@ -90,6 +90,19 @@ describe('local core E2E fixture', () => {
     )
   })
 
+  it('keeps callback CSP allowances isolated to the E2E build config', () => {
+    const production = JSON.parse(
+      readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'),
+    )
+    const e2e = JSON.parse(
+      readFileSync(new URL('../src-tauri/tauri.e2e.conf.json', import.meta.url), 'utf8'),
+    )
+    expect(production.app.security.csp).not.toContain('http://127.0.0.1:3081')
+    expect(production.app.security.csp).not.toContain('script-src \'self\' \'unsafe-inline\'')
+    expect(e2e.app.security.csp).toContain('connect-src \'self\' ipc: http://ipc.localhost http://127.0.0.1:3081')
+    expect(e2e.app.security.csp).toContain('script-src \'self\' \'unsafe-inline\'')
+  })
+
   it('keeps the completed preinstall baseline synchronized with bundled presets', () => {
     const store = JSON.parse(
       readFileSync(new URL('./e2e/store.dat', import.meta.url), 'utf8'),
@@ -176,6 +189,12 @@ describe('local core E2E fixture', () => {
       body: 'x'.repeat(64 * 1024 + 1),
     })
     expect(oversized.status).toBe(413)
+    const invalidShape = await fetch(callbackUrl, {
+      method: 'POST',
+      headers: { origin: 'http://tauri.localhost' },
+      body: JSON.stringify({ unexpected: true }),
+    })
+    expect(invalidShape.status).toBe(400)
     const expected = { value: { full: { width: 1024 }, restored: { width: 1024 } } }
     const accepted = await fetch(callbackUrl, {
       method: 'POST',
@@ -191,6 +210,11 @@ describe('local core E2E fixture', () => {
       body: JSON.stringify(expected),
     })
     expect(duplicate.status).toBe(409)
+    expect(output).toContain('E2E shell result rejected origin')
+    expect(output).toContain('E2E shell result rejected size')
+    expect(output).toContain('E2E shell result rejected shape')
+    expect(output).toContain('E2E shell result accepted')
+    expect(output).toContain('E2E shell result rejected duplicate')
   })
 
   it('accepts a structured shell scenario failure without logging its body', async () => {
@@ -213,5 +237,6 @@ describe('local core E2E fixture', () => {
     expect(accepted.status).toBe(204)
     expect(await (await fetch(callbackUrl)).json()).toEqual(expected)
     expect(output).not.toContain(expected.error)
+    expect(output).toContain('E2E shell result accepted')
   })
 })

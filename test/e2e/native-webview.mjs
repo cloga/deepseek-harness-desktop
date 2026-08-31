@@ -103,7 +103,16 @@ function runShellScenario(callbackUrl) {
   )
 }
 
-const shellScenario = `return (${runShellScenario})(arguments[0])`
+function shellBootstrap(callbackUrl) {
+  const pageScript = `setTimeout(() => (${runShellScenario})(${JSON.stringify(callbackUrl)}), 250)`
+  return `
+    const script = document.createElement('script')
+    script.textContent = ${JSON.stringify(pageScript)}
+    document.documentElement.appendChild(script)
+    script.remove()
+    return { started: true }
+  `
+}
 
 async function webdriver(method, path, body) {
   const response = await fetch(`${endpoint}${path}`, {
@@ -155,11 +164,12 @@ async function main() {
     )
     sessionId = session.sessionId
     const callbackUrl = 'http://127.0.0.1:3081/e2e-shell-result'
-    await webdriver(
+    const bootstrap = await webdriver(
       'POST',
       `/session/${sessionId}/execute/sync`,
-      { script: shellScenario, args: [callbackUrl] },
+      { script: shellBootstrap(callbackUrl), args: [] },
     )
+    assert.equal(bootstrap.started, true)
     const scenario = await waitFor(async () => {
       const response = await fetch(callbackUrl)
       return response.ok ? response.json() : undefined
