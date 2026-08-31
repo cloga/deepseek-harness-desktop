@@ -142,6 +142,8 @@ describe('runtime exit store', () => {
         healthChecks++
         return healthChecks === 1 ? 'Healthy' : 'HARNESS_NOT_READY: transient response'
       }
+      if (command === 'close_harness_webview')
+        return undefined
       throw new Error(`unexpected invoke: ${command}`)
     })
 

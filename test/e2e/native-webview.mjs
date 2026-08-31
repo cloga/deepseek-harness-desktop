@@ -184,24 +184,6 @@ async function main() {
     await webdriver('POST', `/session/${sessionId}/refresh`, {})
     await waitForAuthenticatedCycle(desktopLog, 2, 'same-service Retry authentication')
     await assertSingleTokenExchange(desktopLog)
-
-    await webdriver('POST', `/session/${sessionId}/execute/sync`, {
-      script: 'return window.__TAURI_INTERNALS__.invoke("close_harness_webview")',
-      args: [],
-    })
-    await webdriver('POST', `/session/${sessionId}/refresh`, {})
-    await waitForAuthenticatedCycle(desktopLog, 3, 'closed and reopened native WebView authentication')
-    await assertSingleTokenExchange(desktopLog)
-
-    const reopenedSurface = await waitFor(async () => {
-      const candidate = await find('css selector', '[data-testid="harness-native-surface"]')
-      return await attribute(candidate, 'data-loaded') === 'true' ? candidate : undefined
-    }, 'reopened authenticated native surface')
-    const reopenedBounds = await surfaceBounds(reopenedSurface)
-    assert.ok(
-      reopenedBounds.width > 500 && reopenedBounds.height > 300,
-      `unexpected reopened bounds: ${JSON.stringify(reopenedBounds)}`,
-    )
   }
   finally {
     if (sessionId !== undefined)

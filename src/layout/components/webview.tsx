@@ -29,6 +29,7 @@ const STARTUP_STATUS_KEYS = {
   'process-boot': 'status.loading_process',
   'client-modules': 'status.loading_client_modules',
 } as const
+const OFFSCREEN_NATIVE_WEBVIEW_BOUNDS = { x: -1, y: -1, width: 1, height: 1 }
 
 let harnessAuthProbeListener: Promise<UnlistenFn> | undefined
 
@@ -119,8 +120,9 @@ export function Webview() {
 
     return () => {
       disposed = true
-      if (mounted)
-        void invoke('close_harness_webview')
+      if (mounted) {
+        void invoke('set_harness_webview_bounds', OFFSCREEN_NATIVE_WEBVIEW_BOUNDS)
+      }
       store.harness.nativeWebviewMounted = false
     }
   }, [iframeKey, iframeSrc, nativeWebview, nativeWebviewOrigin, serviceHealthy])
@@ -144,7 +146,7 @@ export function Webview() {
       const base = element.getBoundingClientRect()
       const bounds = next
         ? fitNativeWebviewAroundOverlays(base, floatingOverlayBounds(document))
-        : { x: -1, y: -1, width: 1, height: 1 }
+        : OFFSCREEN_NATIVE_WEBVIEW_BOUNDS
       const serializedBounds = serializeNativeWebviewBounds(bounds)
       const state = JSON.stringify(serializedBounds)
       if (state === lastState)

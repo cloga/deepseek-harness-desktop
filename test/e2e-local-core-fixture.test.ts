@@ -93,6 +93,25 @@ describe('local core E2E fixture', () => {
     expect(firstElementPoll).toBeGreaterThan(probeEvidence)
   })
 
+  it('keeps the authenticated child offscreen across a same-service remount', () => {
+    const webview = readFileSync(
+      new URL('../src/layout/components/webview.tsx', import.meta.url),
+      'utf8',
+    )
+    const cleanup = webview
+      .split('async function syncNativeWebview()')[1]
+      ?.split('}, [iframeKey')[0]
+    expect(cleanup).toContain('set_harness_webview_bounds')
+    expect(cleanup).toContain('OFFSCREEN_NATIVE_WEBVIEW_BOUNDS')
+    expect(cleanup).not.toContain('close_harness_webview')
+
+    const store = readFileSync(
+      new URL('../src/store/modules/harness/store.ts', import.meta.url),
+      'utf8',
+    )
+    expect(store).toContain('failed to close native Harness WebView after startup failure')
+  })
+
   it('places the debug store at the Tauri app-data root', () => {
     const workflow = readFileSync(
       new URL('../.github/workflows/ci.yml', import.meta.url),

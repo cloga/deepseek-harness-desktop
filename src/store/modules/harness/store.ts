@@ -573,6 +573,8 @@ export const harness = defineStore({
       this.serviceUrl = readyInfo.service_url
       this.nativeWebview = preparation.verify_auth
       this.nativeWebviewOrigin = preparation.probe_origin ?? ''
+      if (!preparation.verify_auth)
+        await invoke('close_harness_webview')
       const authProbe = preparation.verify_auth
         ? waitForIframeAuthProbe(preparation.probe_origin ?? new URL(preparation.url).origin)
         : undefined
@@ -704,6 +706,9 @@ export const harness = defineStore({
         }
       }
       catch (err) {
+        await invoke('close_harness_webview').catch((closeError) => {
+          console.error('[Harness] failed to close native Harness WebView after startup failure:', closeError)
+        })
         // 失败时附上服务日志里的真实错误行，供错误界面展示而不是只显示超时文案
         throw await attachStartupDiagnostics(err)
       }
