@@ -37,6 +37,40 @@ fn windows_drag_browser_args() -> &'static str {
     WINDOWS_DRAG_BROWSER_ARGS
 }
 
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsWebviewOptions {
+    data_directory_name: Option<&'static str>,
+    additional_browser_args: Option<&'static str>,
+}
+
+#[cfg(windows)]
+fn windows_webview_options(
+    automation_enabled: bool,
+    debug_assertions: bool,
+) -> WindowsWebviewOptions {
+    if automation_enabled {
+        return WindowsWebviewOptions {
+            data_directory_name: None,
+            additional_browser_args: None,
+        };
+    }
+
+    WindowsWebviewOptions {
+        data_directory_name: Some(if debug_assertions {
+            "EBWebView-dev"
+        } else {
+            "EBWebView"
+        }),
+        additional_browser_args: Some(windows_drag_browser_args()),
+    }
+}
+
+#[cfg(windows)]
+fn webview_automation_enabled() -> bool {
+    std::env::var("TAURI_WEBVIEW_AUTOMATION").as_deref() == Ok("true")
+}
+
 /// setup app
 pub fn setup(app_handle: tauri::AppHandle) {
     // 升级清理：内部插件资源已迁至 resources/internal-plugins；旧安装可能保留
@@ -349,24 +383,28 @@ pub fn build_main_window(app: &tauri::AppHandle<Wry>) -> tauri::Result<tauri::We
     // Windows/WebView2 在 build() 尚未返回时就可能绘制窗口。先隐藏创建，
     // 等保存的几何恢复完成再显示，避免启动时先闪出默认尺寸再跳到历史尺寸。
     #[cfg(windows)]
-    let webview_builder = webview_builder
-        .visible(false)
-        // 开发版使用独立 WebView2 数据目录，避免已有 release 实例、热重启残留
-        // 或其他同标识实例占用同一 User Data 管道，触发 HRESULT 0x8007139F。
-        .data_directory({
+    let webview_builder = {
+        let options = windows_webview_options(webview_automation_enabled(), cfg!(debug_assertions));
+        let webview_builder = webview_builder.visible(false);
+        // WebDriver automation 由 EdgeDriver 注入临时数据目录和调试参数；覆盖这些
+        // 选项会令 driver 等不到 DevToolsActivePort。正常运行仍使用应用隔离目录。
+        let webview_builder = if let Some(directory_name) = options.data_directory_name {
             let mut directory = app
                 .path()
                 .app_local_data_dir()
                 .expect("Failed to resolve app local data directory");
-            directory.push(if cfg!(debug_assertions) {
-                "EBWebView-dev"
-            } else {
-                "EBWebView"
-            });
-            directory
-        })
-        // WebView2 原生非客户区可直接接收触摸输入；同时禁用会抢占手势的弹性滚动。
-        .additional_browser_args(windows_drag_browser_args());
+            directory.push(directory_name);
+            webview_builder.data_directory(directory)
+        } else {
+            webview_builder
+        };
+        if let Some(browser_args) = options.additional_browser_args {
+            // WebView2 原生非客户区可直接接收触摸输入；同时禁用会抢占手势的弹性滚动。
+            webview_builder.additional_browser_args(browser_args)
+        } else {
+            webview_builder
+        }
+    };
 
     // macOS 保留原生交通灯：绿色按钮由 AppKit 进入独立 Space 的原生全屏，
     // 同时用 Overlay 让 44px 壳层导航栏继续与窗口 chrome 融合。其他平台
@@ -467,7 +505,7 @@ pub fn build_main_window(app: &tauri::AppHandle<Wry>) -> tauri::Result<tauri::We
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::windows_drag_browser_args;
+    use super::{windows_drag_browser_args, windows_webview_options};
 
     #[test]
     fn windows_drag_args_enable_touch_drag_and_disable_overscroll() {
@@ -477,6 +515,30 @@ mod tests {
         assert!(args.contains("msWebOOUI,msPdfOOUI"));
         let smart_screen = ["ms", "SmartScreen", "Protection"].concat();
         assert!(!args.contains(smart_screen.as_str()));
+    }
+
+    #[test]
+    fn automation_does_not_override_webview2_driver_options() {
+        let options = windows_webview_options(true, true);
+        assert_eq!(options.data_directory_name, None);
+        assert_eq!(options.additional_browser_args, None);
+    }
+
+    #[test]
+    fn normal_windows_webview_keeps_isolation_and_drag_args() {
+        let debug = windows_webview_options(false, true);
+        assert_eq!(debug.data_directory_name, Some("EBWebView-dev"));
+        assert_eq!(
+            debug.additional_browser_args,
+            Some(windows_drag_browser_args())
+        );
+
+        let release = windows_webview_options(false, false);
+        assert_eq!(release.data_directory_name, Some("EBWebView"));
+        assert_eq!(
+            release.additional_browser_args,
+            Some(windows_drag_browser_args())
+        );
     }
 }
 
