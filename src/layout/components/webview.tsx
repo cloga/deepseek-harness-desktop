@@ -11,6 +11,7 @@ import { PluginRecovery } from '@/components/plugin-recovery'
 import { useDesktopZoom } from '@/hooks/use-desktop-zoom'
 import { useIframeShim } from '@/hooks/use-iframe-shim'
 import { store } from '@/store'
+import { hasBlockingOverlay, shouldShowNativeWebview } from '@/utils/native-webview-visibility'
 import { Loadable } from './loadable'
 import { Navbar } from './navbar'
 import { PreinstallSetup } from './preinstall-setup'
@@ -45,6 +46,7 @@ export function Webview() {
     startupPhase,
     iframeError,
     iframeKey,
+    iframeLoaded,
     iframeSrc,
     nativeWebview,
     nativeWebviewOrigin,
@@ -126,6 +128,27 @@ export function Webview() {
         void invoke('close_harness_webview')
     }
   }, [iframeKey, iframeSrc, nativeWebview, nativeWebviewOrigin, serviceHealthy])
+  useEffect(() => {
+    if (!nativeWebview)
+      return
+    let shown: boolean | undefined
+    function syncVisibility() {
+      const next = shouldShowNativeWebview(
+        nativeWebview,
+        serviceHealthy,
+        iframeLoaded,
+        hasBlockingOverlay(document),
+      )
+      if (next === shown)
+        return
+      shown = next
+      void invoke(next ? 'show_harness_webview' : 'hide_harness_webview')
+    }
+    const observer = new MutationObserver(syncVisibility)
+    observer.observe(document.body, { childList: true, subtree: true })
+    syncVisibility()
+    return () => observer.disconnect()
+  }, [iframeLoaded, nativeWebview, serviceHealthy])
   if (status === 'error') {
     return (
       <main className="relative flex min-h-0 flex-1 flex-col bg-canvas">

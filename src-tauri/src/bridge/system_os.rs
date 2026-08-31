@@ -197,11 +197,15 @@ pub async fn mount_harness_webview(
         .ok_or_else(|| "HARNESS_WEBVIEW_WINDOW_MISSING: main window not found".to_string())?;
     let event_app = app_handle.clone();
     let event_origin = probe_origin.clone();
+    let destination = url
+        .parse()
+        .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?;
     let builder = tauri::webview::WebviewBuilder::new(
         "harness",
         WebviewUrl::External(
-            url.parse()
-                .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?,
+            "about:blank"
+                .parse()
+                .expect("about:blank must remain a valid URL"),
         ),
     )
     .initialization_script(crate::desktop::auth_probe::AUTH_TOP_LEVEL_PROBE_JS)
@@ -224,9 +228,10 @@ pub async fn mount_harness_webview(
             );
             return false;
         }
-        target.scheme() == "http"
-            && target.host_str() == Some("127.0.0.1")
-            && (target.port() == relay_port || target.port() == harness_port)
+        target.as_str() == "about:blank"
+            || target.scheme() == "http"
+                && target.host_str() == Some("127.0.0.1")
+                && (target.port() == relay_port || target.port() == harness_port)
     });
     let webview = window
         .add_child(
@@ -237,7 +242,10 @@ pub async fn mount_harness_webview(
         .map_err(|_| "HARNESS_WEBVIEW_CREATE_FAILED: child WebView creation failed".to_string())?;
     webview
         .hide()
-        .map_err(|_| "HARNESS_WEBVIEW_HIDE_FAILED: child WebView hide failed".to_string())
+        .map_err(|_| "HARNESS_WEBVIEW_HIDE_FAILED: child WebView hide failed".to_string())?;
+    webview
+        .navigate(destination)
+        .map_err(|_| "HARNESS_WEBVIEW_NAVIGATE_FAILED: child WebView navigation failed".to_string())
 }
 
 #[tauri::command]
@@ -266,6 +274,16 @@ pub fn show_harness_webview(app_handle: AppHandle) -> Result<(), String> {
         .ok_or_else(|| "HARNESS_WEBVIEW_MISSING: child WebView not found".to_string())?
         .show()
         .map_err(|_| "HARNESS_WEBVIEW_SHOW_FAILED: child WebView show failed".to_string())
+}
+
+#[tauri::command]
+pub fn hide_harness_webview(app_handle: AppHandle) -> Result<(), String> {
+    if let Some(webview) = app_handle.get_webview("harness") {
+        webview
+            .hide()
+            .map_err(|_| "HARNESS_WEBVIEW_HIDE_FAILED: child WebView hide failed".to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
