@@ -112,25 +112,40 @@ async function main() {
     const full = await surfaceBounds(surface)
     assert.ok(full.width > 500 && full.height > 300, `unexpected initial bounds: ${JSON.stringify(full)}`)
 
-    const help = await find('xpath', '//button[normalize-space()="帮助"]')
+    const help = await waitFor(
+      () => find('css selector', '[data-testid="desktop-help-button"]'),
+      'Help button',
+    )
     await click(help)
     await waitFor(async () => (await surfaceBounds(surface)).height < full.height, 'Help overlay crop')
     const helpBounds = await surfaceBounds(surface)
     assert.ok(helpBounds.width > 500 && helpBounds.height > 100, 'Help must not hide the main surface')
 
-    const logs = await find('xpath', '//*[@role="menuitem" and contains(.,"运行日志")]')
+    const logs = await waitFor(
+      () => find('css selector', '[data-testid="copy-run-logs-menu-item"]'),
+      'Run Logs menu item',
+    )
     await click(logs)
-    await find('css selector', '[data-slot="toast"]')
+    await waitFor(() => find('css selector', '[data-slot="toast"]'), 'run logs toast')
     await waitFor(async () => (await surfaceBounds(surface)).height < full.height, 'toast overlay crop')
-    const toastClose = await find('css selector', '[data-slot="toast-close"]')
+    const toastClose = await waitFor(
+      () => find('css selector', '[data-slot="toast-close"]'),
+      'toast close button',
+    )
     await click(toastClose)
     await waitFor(async () => (await surfaceBounds(surface)).height === full.height, 'Help bounds restore')
 
-    const settings = await find('xpath', '//button[normalize-space()="配置"]')
+    const settings = await waitFor(
+      () => find('css selector', '[data-testid="desktop-config-button"]'),
+      'Settings button',
+    )
     await click(settings)
-    await find('css selector', '[data-slot="modal-backdrop"]')
+    await waitFor(() => find('css selector', '[data-slot="modal-backdrop"]'), 'Settings modal')
     await waitFor(async () => (await surfaceBounds(surface)).width === 1, 'Settings modal offscreen bounds')
-    const close = await find('css selector', '[data-slot="modal-close-trigger"]')
+    const close = await waitFor(
+      () => find('css selector', '[data-slot="modal-close-trigger"]'),
+      'Settings close button',
+    )
     await click(close)
     await waitFor(async () => (await surfaceBounds(surface)).width === full.width, 'Settings bounds restore')
   }

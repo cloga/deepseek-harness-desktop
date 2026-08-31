@@ -269,6 +269,7 @@ export function Navbar({ iframeRef }: NavbarProps) {
         <div className="ml-1">
           <Button
             className="rounded-lg h-6 text-xs px-1.5"
+            data-testid="desktop-config-button"
             size="sm"
             variant="ghost"
             onPress={handleOpenConfig}
@@ -278,6 +279,7 @@ export function Navbar({ iframeRef }: NavbarProps) {
           <Dropdown>
             <Button
               className="rounded-lg h-6 text-xs px-1.5"
+              data-testid="desktop-help-button"
               size="sm"
               variant="ghost"
               aria-label={t('app.expand_sidebar')}
@@ -288,6 +290,7 @@ export function Navbar({ iframeRef }: NavbarProps) {
               <Dropdown.Menu>
                 <Dropdown.Item
                   className="rounded-md"
+                  data-testid="copy-run-logs-menu-item"
                   id="copy-run-logs"
                   textValue={t('menu.run_logs')}
                   onAction={() => handleHelpAction('copy-run-logs')}
