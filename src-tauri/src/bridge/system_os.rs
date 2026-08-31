@@ -627,7 +627,8 @@ mod tests {
     fn child_webview_uses_initial_navigation_instead_of_racy_post_create_navigation() {
         let source = include_str!("system_os.rs");
         assert!(source.contains("WebviewUrl::External(destination)"));
-        assert!(!source.contains("webview.navigate(destination)"));
+        let post_create_navigation = ["webview", ".navigate(destination)"].concat();
+        assert!(!source.contains(&post_create_navigation));
     }
 
     #[test]
