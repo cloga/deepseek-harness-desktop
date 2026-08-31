@@ -65,7 +65,6 @@ async function main() {
         capabilities: {
           alwaysMatch: {
             'browserName': 'wry',
-            'tauri:options': { application },
           },
         },
       }),

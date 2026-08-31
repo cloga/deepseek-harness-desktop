@@ -151,17 +151,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build WebDriver-enabled desktop app
-        run: pnpm exec tauri build --debug --no-bundle
-
-      - name: Install tauri-driver
-        run: cargo install tauri-driver --locked
-
-      - name: Install matching WebView2 driver
-        shell: pwsh
-        run: |
-          cargo install --git https://github.com/chippers/msedgedriver-tool
-          & "$HOME\.cargo\bin\msedgedriver-tool.exe"
-          $PWD.Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        run: pnpm exec tauri build --debug --no-bundle --features webdriver
 
       - name: Prepare isolated desktop state
         shell: pwsh
@@ -178,22 +168,6 @@ jobs:
       - name: Run fresh native WebView flow
         shell: pwsh
         run: |
-          $edgeDriver = Get-Command msedgedriver.exe -ErrorAction SilentlyContinue |
-            Select-Object -First 1 -ExpandProperty Source
-          if (-not $edgeDriver) {
-            $edgeDriver = Get-ChildItem C:\SeleniumWebDrivers -Recurse -Filter msedgedriver.exe |
-              Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $edgeDriver) {
-            throw 'msedgedriver.exe is not available on the Windows runner'
-          }
-          $edgeVersion = (Get-Item $edgeDriver).VersionInfo.FileVersion
-          $webViewVersion = Get-ItemPropertyValue `
-            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F1E7EFC4-4D73-4C4C-8F5D-C36C7D1A5A70}' `
-            -Name pv -ErrorAction SilentlyContinue
-          Write-Host "EdgeDriver: $edgeDriver ($edgeVersion)"
-          Write-Host "WebView2 runtime: $webViewVersion"
-
           function Write-SanitizedLog([string] $Path) {
             if (-not (Test-Path $Path)) {
               return
@@ -210,17 +184,26 @@ jobs:
             Write-Host '::endgroup::'
           }
 
-          $driverOut = Join-Path $env:RUNNER_TEMP 'tauri-driver.stdout.log'
-          $driverErr = Join-Path $env:RUNNER_TEMP 'tauri-driver.stderr.log'
-          $driver = Start-Process tauri-driver -ArgumentList '--native-driver', $edgeDriver -PassThru `
-            -RedirectStandardOutput $driverOut -RedirectStandardError $driverErr
+          $appOut = Join-Path $env:RUNNER_TEMP 'desktop.stdout.log'
+          $appErr = Join-Path $env:RUNNER_TEMP 'desktop.stderr.log'
+          $env:TAURI_WEBDRIVER_PORT = '4444'
+          $app = Start-Process $env:DSH_E2E_APPLICATION -PassThru `
+            -RedirectStandardOutput $appOut -RedirectStandardError $appErr
           $testExitCode = 0
           try {
-            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 240; $attempt++) {
+              if ($app.HasExited) {
+                throw "Desktop exited before embedded WebDriver startup (code $($app.ExitCode))"
+              }
               if (Test-NetConnection 127.0.0.1 -Port 4444 -InformationLevel Quiet -WarningAction SilentlyContinue) {
+                $ready = $true
                 break
               }
               Start-Sleep -Milliseconds 250
+            }
+            if (-not $ready) {
+              throw 'Embedded WebDriver did not listen on 127.0.0.1:4444 within 60 seconds'
             }
             pnpm run test:e2e:native
             $testExitCode = $LASTEXITCODE
@@ -230,23 +213,13 @@ jobs:
             $testExitCode = 1
           }
           finally {
-            $appProcesses = Get-CimInstance Win32_Process |
-              Where-Object { $_.ExecutablePath -eq $env:DSH_E2E_APPLICATION }
-            if ($appProcesses) {
-              $appProcesses |
-                Select-Object ProcessId, ParentProcessId, CreationDate, ExecutablePath |
-                Format-List
+            if (-not $app.HasExited) {
+              & taskkill /PID $app.Id /T /F
+              $app.WaitForExit(10000)
             }
-            else {
-              Write-Host 'Desktop process is not running after the session failure.'
-            }
-
-            if (-not $driver.HasExited) {
-              Stop-Process -Id $driver.Id -ErrorAction SilentlyContinue
-              $driver.WaitForExit(10000)
-            }
-            Write-SanitizedLog $driverOut
-            Write-SanitizedLog $driverErr
+            Write-Host "Desktop exit code: $($app.ExitCode)"
+            Write-SanitizedLog $appOut
+            Write-SanitizedLog $appErr
 
             $desktopData = Join-Path $env:APPDATA 'io.github.hairyf.deepseek-harness-desktop'
             @(

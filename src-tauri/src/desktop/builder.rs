@@ -37,6 +37,20 @@ fn windows_drag_browser_args() -> &'static str {
     WINDOWS_DRAG_BROWSER_ARGS
 }
 
+#[cfg(all(test, feature = "webdriver"))]
+mod webdriver_security_tests {
+    use super::parse_webdriver_port;
+
+    #[test]
+    fn webdriver_requires_an_explicit_nonzero_port() {
+        assert_eq!(parse_webdriver_port(None), None);
+        assert_eq!(parse_webdriver_port(Some("")), None);
+        assert_eq!(parse_webdriver_port(Some("invalid")), None);
+        assert_eq!(parse_webdriver_port(Some("0")), None);
+        assert_eq!(parse_webdriver_port(Some("4444")), Some(4444));
+    }
+}
+
 #[cfg(windows)]
 #[derive(Debug, PartialEq, Eq)]
 struct WindowsWebviewOptions {
@@ -69,6 +83,11 @@ fn windows_webview_options(
 #[cfg(windows)]
 fn webview_automation_enabled() -> bool {
     std::env::var("TAURI_WEBVIEW_AUTOMATION").as_deref() == Ok("true")
+}
+
+#[cfg(feature = "webdriver")]
+fn parse_webdriver_port(value: Option<&str>) -> Option<u16> {
+    value?.parse().ok().filter(|port| *port != 0)
 }
 
 /// setup app
@@ -641,7 +660,20 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
 
 // configure tauri builder
 pub fn builder() -> tauri::Builder<tauri::Wry> {
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // 内嵌 WebDriver 会开放本机 HTTP 自动化端点，只允许显式测试 feature 编译，
+    // 默认 debug/release 构建均不包含该插件。
+    #[cfg(feature = "webdriver")]
+    let builder = match parse_webdriver_port(
+        std::env::var(tauri_plugin_wdio_webdriver::PORT_ENV_VAR)
+            .ok()
+            .as_deref(),
+    ) {
+        Some(port) => builder.plugin(tauri_plugin_wdio_webdriver::init_with_port(port)),
+        None => builder,
+    };
+
+    let builder = builder
         .setup(|app| {
             let app_handle = app.handle().clone();
             build_main_window(&app_handle)?;
