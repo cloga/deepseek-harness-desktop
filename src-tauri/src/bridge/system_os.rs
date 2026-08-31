@@ -626,9 +626,14 @@ mod tests {
     #[test]
     fn child_webview_uses_initial_navigation_instead_of_racy_post_create_navigation() {
         let source = include_str!("system_os.rs");
-        assert!(source.contains("WebviewUrl::External(destination)"));
+        let mount = source
+            .split("pub async fn mount_harness_webview")
+            .nth(1)
+            .and_then(|tail| tail.split("#[tauri::command]").next())
+            .expect("mount_harness_webview function source");
+        assert!(mount.contains("WebviewUrl::External(destination)"));
         let post_create_navigation = ["webview", ".navigate(destination)"].concat();
-        assert!(!source.contains(&post_create_navigation));
+        assert!(!mount.contains(&post_create_navigation));
     }
 
     #[test]
