@@ -170,8 +170,12 @@ async fn start_harness_cookie_relay(
             return;
         };
         let request = String::from_utf8_lossy(&request[..size]);
-        let expected_prefix = format!("GET {expected_path} ");
-        let response = if request.starts_with(&expected_prefix) {
+        let request_path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|target| target.split('?').next());
+        let response = if request_path == Some(expected_path.as_str()) {
             format!(
                 "HTTP/1.1 303 See Other\r\nLocation: {target_url}\r\nSet-Cookie: {cookie}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
@@ -540,7 +544,7 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("relay client")
-            .get(relay)
+            .get(format!("{relay}?t=123"))
             .send()
             .await
             .expect("relay response");
