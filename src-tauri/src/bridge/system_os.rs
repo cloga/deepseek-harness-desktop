@@ -8,7 +8,7 @@ use crate::config;
 use crate::logger;
 use crate::service::core;
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -39,6 +39,8 @@ pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeIn
 pub struct HarnessWebviewPreparation {
     url: String,
     verify_auth: bool,
+    claim: Option<crate::service::workflow::utils::HarnessLaunchClaimId>,
+    probe_origin: Option<String>,
 }
 
 #[tauri::command]
@@ -54,52 +56,38 @@ pub async fn prepare_harness_webview(
         return Ok(HarnessWebviewPreparation {
             url: service_url,
             verify_auth: false,
+            claim: None,
+            probe_origin: None,
         });
     };
-    let result = prepare_claimed_harness_webview(&app_handle, &claim, &service_url).await;
-    let finished =
-        crate::service::workflow::utils::finish_harness_launch_claim(&claim, result.is_ok());
-    if !finished {
-        return Err("HARNESS_AUTH_OWNER_CHANGED: launch owner changed during delivery".into());
+    match prepare_claimed_harness_webview(&claim).await {
+        Ok(preparation) => Ok(preparation),
+        Err(error) => {
+            crate::service::workflow::utils::finish_harness_launch_claim(&claim, false);
+            Err(error)
+        }
     }
-    result
 }
 
 async fn prepare_claimed_harness_webview(
-    app_handle: &AppHandle,
     claim: &crate::service::workflow::utils::HarnessLaunchClaim,
-    service_url: &str,
 ) -> Result<HarnessWebviewPreparation, String> {
     let (cookie, iframe_url) = exchange_harness_cookie(claim.url()).await?;
-    let cookie_name = cookie.name().to_string();
-    let window = app_handle
-        .get_webview_window("main")
-        .ok_or_else(|| "HARNESS_AUTH_WEBVIEW_MISSING: main WebView not found".to_string())?;
-    window
-        .set_cookie(cookie)
-        .map_err(|error| format!("HARNESS_AUTH_COOKIE_SET_FAILED: {error}"))?;
-    let cookie_url = tauri::Url::parse(&iframe_url)
-        .map_err(|error| format!("HARNESS_AUTH_URL_INVALID: {error}"))?;
-    let cookies = tauri::async_runtime::spawn_blocking(move || window.cookies_for_url(cookie_url))
-        .await
-        .map_err(|error| format!("HARNESS_AUTH_COOKIE_VERIFY_JOIN_FAILED: {error}"))?
-        .map_err(|error| format!("HARNESS_AUTH_COOKIE_VERIFY_FAILED: {error}"))?;
-    if !cookies
-        .iter()
-        .any(|cookie| cookie.name() == cookie_name.as_str())
-    {
-        return Err("HARNESS_AUTH_COOKIE_NOT_STORED: WebView rejected session cookie".into());
-    }
+    let probe_origin = reqwest::Url::parse(&iframe_url)
+        .map_err(|_| "HARNESS_AUTH_URL_INVALID: clean iframe URL is invalid".to_string())?
+        .origin()
+        .ascii_serialization();
+    let relay_url = start_harness_cookie_relay(cookie, iframe_url, claim.id()).await?;
     Ok(HarnessWebviewPreparation {
-        url: iframe_url,
+        url: relay_url,
         verify_auth: true,
+        claim: Some(claim.id()),
+        probe_origin: Some(probe_origin),
     })
 }
 
 /// 向核心提交一次性 token，仅接受 303 + HttpOnly Cookie 的完整交换结果。
-async fn exchange_harness_cookie(
-    launch_url: &str,
-) -> Result<(tauri::webview::Cookie<'static>, String), String> {
+async fn exchange_harness_cookie(launch_url: &str) -> Result<(String, String), String> {
     let mut exchange_url = reqwest::Url::parse(launch_url)
         .map_err(|error| format!("HARNESS_AUTH_URL_INVALID: {error}"))?;
     if exchange_url.scheme() != "http" || exchange_url.host_str() != Some("127.0.0.1") {
@@ -147,12 +135,61 @@ async fn exchange_harness_cookie(
     // Web UI lives in an iframe below the Tauri shell, so its genuine signed cookie must
     // explicitly allow that third-party context. localhost remains loopback-only, and the
     // core's Host/Origin fence still rejects cross-site API traffic.
-    cookie.set_domain("localhost");
     cookie.set_path("/");
     cookie.set_same_site(tauri::webview::cookie::SameSite::None);
     cookie.set_secure(true);
     exchange_url.set_query(None);
-    Ok((cookie, exchange_url.to_string()))
+    Ok((cookie.to_string(), exchange_url.to_string()))
+}
+
+/// 让真实 WebView HTTP 响应设置 cookie，绕过平台 cookie-adapter 的 SameSite 差异。
+async fn start_harness_cookie_relay(
+    cookie: String,
+    target_url: String,
+    claim: crate::service::workflow::utils::HarnessLaunchClaimId,
+) -> Result<String, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|_| "HARNESS_AUTH_RELAY_BIND_FAILED: loopback bind failed".to_string())?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| "HARNESS_AUTH_RELAY_ADDRESS_FAILED: loopback address unavailable".to_string())?
+        .port();
+    let path = format!("/dsh-auth/{}/{}", claim.generation, claim.pid);
+    let expected_path = path.clone();
+    tauri::async_runtime::spawn(async move {
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(20), listener.accept()).await;
+        let Ok(Ok((mut stream, _))) = accepted else {
+            return;
+        };
+        let mut request = [0_u8; 2048];
+        let Ok(size) = stream.read(&mut request).await else {
+            return;
+        };
+        let request = String::from_utf8_lossy(&request[..size]);
+        let expected_prefix = format!("GET {expected_path} ");
+        let response = if request.starts_with(&expected_prefix) {
+            format!(
+                "HTTP/1.1 303 See Other\r\nLocation: {target_url}\r\nSet-Cookie: {cookie}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        } else {
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        };
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    });
+    Ok(format!("http://localhost:{port}{path}"))
+}
+
+#[tauri::command]
+pub fn finish_harness_webview_auth(generation: u64, pid: u32, success: bool) -> Result<(), String> {
+    let id = crate::service::workflow::utils::HarnessLaunchClaimId { generation, pid };
+    crate::service::workflow::utils::finish_harness_webview_claim(id, success)
+        .then_some(())
+        .ok_or_else(|| "HARNESS_AUTH_OWNER_CHANGED: WebView claim no longer owns launch".into())
 }
 
 /// 在系统浏览器中打开 Harness 界面
@@ -391,7 +428,9 @@ pub async fn open_external_url(app_handle: AppHandle, url: String) -> Result<(),
 mod tests {
     use super::exchange_harness_cookie;
     use super::is_frontend_log_line;
+    use super::start_harness_cookie_relay;
     use super::tail_bytes;
+    use crate::service::workflow::utils::HarnessLaunchClaimId;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -467,15 +506,17 @@ mod tests {
             .expect("anonymous request");
         assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-        let (cookie, iframe_url) = exchange_harness_cookie(&format!(
+        let (cookie_header, iframe_url) = exchange_harness_cookie(&format!(
             "http://127.0.0.1:{}/?token=one-shot",
             address.port()
         ))
         .await
         .expect("token exchange");
+        let cookie =
+            tauri::webview::Cookie::parse(cookie_header.clone()).expect("relay cookie parses");
         assert_eq!(cookie.name(), "dsh-auth-test");
         assert_eq!(cookie.http_only(), Some(true));
-        assert_eq!(cookie.domain(), Some("localhost"));
+        assert_eq!(cookie.domain(), None);
         assert_eq!(cookie.path(), Some("/"));
         assert_eq!(
             cookie.same_site(),
@@ -484,6 +525,38 @@ mod tests {
         assert_eq!(cookie.secure(), Some(true));
         assert_eq!(iframe_url, format!("http://localhost:{}/", address.port()));
         server.join().expect("fixture server");
+
+        let relay = start_harness_cookie_relay(
+            cookie_header,
+            iframe_url.clone(),
+            HarnessLaunchClaimId {
+                generation: 9,
+                pid: 42,
+            },
+        )
+        .await
+        .expect("start relay");
+        let relay_response = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("relay client")
+            .get(relay)
+            .send()
+            .await
+            .expect("relay response");
+        assert_eq!(relay_response.status(), reqwest::StatusCode::SEE_OTHER);
+        assert_eq!(
+            relay_response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(iframe_url.as_str())
+        );
+        assert!(relay_response
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("SameSite=None") && value.contains("Secure")));
     }
 
     #[tokio::test]

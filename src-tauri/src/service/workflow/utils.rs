@@ -38,9 +38,22 @@ pub struct HarnessLaunchClaim {
     consumer: HarnessLaunchConsumer,
 }
 
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct HarnessLaunchClaimId {
+    pub generation: u64,
+    pub pid: u32,
+}
+
 impl HarnessLaunchClaim {
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    pub fn id(&self) -> HarnessLaunchClaimId {
+        HarnessLaunchClaimId {
+            generation: self.generation,
+            pid: self.pid,
+        }
     }
 }
 
@@ -188,22 +201,26 @@ pub fn claim_harness_browser_launch(port: u16) -> Result<Option<HarnessLaunchCla
 }
 
 /// 成功后才消费交付权；失败释放 claim，允许同一 generation/PID 安全重试。
-pub fn finish_harness_launch_claim(claim: &HarnessLaunchClaim, success: bool) -> bool {
+fn finish_harness_launch(
+    id: HarnessLaunchClaimId,
+    consumer: HarnessLaunchConsumer,
+    success: bool,
+) -> bool {
     let mut state = harness_launch_state()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let Some(owner) = state.owner.as_mut() else {
         return false;
     };
-    if owner.generation != claim.generation
-        || owner.pid != Some(claim.pid)
-        || owner.in_flight != Some(claim.consumer)
+    if owner.generation != id.generation
+        || owner.pid != Some(id.pid)
+        || owner.in_flight != Some(consumer)
     {
         return false;
     }
     owner.in_flight = None;
     if success {
-        match claim.consumer {
+        match consumer {
             HarnessLaunchConsumer::Webview => owner.webview_pending = false,
             HarnessLaunchConsumer::Browser => owner.browser_pending = false,
         }
@@ -212,6 +229,14 @@ pub fn finish_harness_launch_claim(claim: &HarnessLaunchClaim, success: bool) ->
         }
     }
     true
+}
+
+pub fn finish_harness_launch_claim(claim: &HarnessLaunchClaim, success: bool) -> bool {
+    finish_harness_launch(claim.id(), claim.consumer, success)
+}
+
+pub fn finish_harness_webview_claim(id: HarnessLaunchClaimId, success: bool) -> bool {
+    finish_harness_launch(id, HarnessLaunchConsumer::Webview, success)
 }
 
 /// 捕获 dsh 公布的一次性浏览器认证 URL，并返回适合写日志的脱敏文本。

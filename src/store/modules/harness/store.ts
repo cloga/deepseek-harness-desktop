@@ -95,6 +95,21 @@ interface HarnessRuntimeInfo {
 interface HarnessWebviewPreparation {
   url: string
   verify_auth: boolean
+  claim: { generation: number, pid: number } | null
+  probe_origin: string | null
+}
+
+async function finishHarnessWebviewClaim(
+  preparation: HarnessWebviewPreparation,
+  success: boolean,
+): Promise<void> {
+  if (preparation.claim === null)
+    return
+  await invoke('finish_harness_webview_auth', {
+    generation: preparation.claim.generation,
+    pid: preparation.claim.pid,
+    success,
+  })
 }
 
 function waitForIframeAuthProbe(origin: string): Promise<void> {
@@ -540,20 +555,30 @@ export const harness = defineStore({
 
       const readyInfo = await invoke<HarnessRuntimeInfo>('get_runtime_info')
       const preparation = await invoke<HarnessWebviewPreparation>('prepare_harness_webview', { generation: launchGeneration })
-      if (token !== bootToken)
+      if (token !== bootToken) {
+        await finishHarnessWebviewClaim(preparation, false)
         return false
+      }
 
       this.serviceUrl = readyInfo.service_url
       const authProbe = preparation.verify_auth
-        ? waitForIframeAuthProbe(new URL(preparation.url).origin)
+        ? waitForIframeAuthProbe(preparation.probe_origin ?? new URL(preparation.url).origin)
         : undefined
       this.iframeSrc = generateTimestampedUrl(preparation.url)
       this.serviceHealthy = true
       if (authProbe !== undefined) {
         try {
           await authProbe
+          if (token !== bootToken) {
+            await finishHarnessWebviewClaim(preparation, false)
+            return false
+          }
+          await finishHarnessWebviewClaim(preparation, true)
         }
         catch (error) {
+          await finishHarnessWebviewClaim(preparation, false).catch((finishError) => {
+            console.error('[Harness] failed to release WebView auth claim:', finishError)
+          })
           this.serviceHealthy = false
           this.iframeLoaded = false
           throw error

@@ -846,6 +846,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tao",
  "tar",
  "tauri",
  "tauri-build",
@@ -866,6 +867,7 @@ dependencies = [
  "windows-core 0.61.2",
  "windows-sys 0.61.2",
  "winreg 0.55.0",
+ "wry",
  "zip",
 ]
 
