@@ -164,6 +164,25 @@ jobs:
           Copy-Item test\e2e\local-core\node_modules\@deepseek-ai\dsh\package.json $managed
           Copy-Item test\e2e\local-core\node_modules\@deepseek-ai\dsh\lib\bin.js (Join-Path $managed 'lib\bin.js')
           New-Item -ItemType Directory -Force -Path $dshHome | Out-Null
+          $env:DSH_HOME = $dshHome
+          $internalRoot = (
+            Resolve-Path 'src-tauri\target\debug\resources\internal-plugins'
+          ).Path.Replace('\', '/')
+          $pluginNames = @(
+            'dsh-tauri',
+            'dsh-tauri-ui',
+            'dsh-tauri-worktree',
+            'dsh-tauri-panel',
+            'dsh-tauri-panel-extension',
+            'dsh-tauri-session',
+            'dsh-tauri-rightclick'
+          )
+          $specs = $pluginNames | ForEach-Object { "link:$internalRoot/$_" }
+          & node test\e2e\local-core\node_modules\@deepseek-ai\dsh\lib\bin.js `
+            plugin --profile web add @specs
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to prepare the completed E2E plugin profile'
+          }
 
       - name: Run fresh native WebView flow
         shell: pwsh
