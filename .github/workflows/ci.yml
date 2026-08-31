@@ -128,7 +128,7 @@ jobs:
     if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
     runs-on: windows-latest
     env:
-      DSH_HOME: ${{ runner.temp }}\dsh-home
+      DSH_HOME: ${{ github.workspace }}\.e2e\dsh-home
       DSH_CLI_PATH: ${{ github.workspace }}\test\e2e\local-core\dsh.cmd
       DSH_E2E_APPLICATION: ${{ github.workspace }}\src-tauri\target\release\deepseek-harness-desktop.exe
     steps:
