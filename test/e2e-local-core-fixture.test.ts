@@ -33,6 +33,19 @@ afterEach(() => {
 })
 
 describe('local core E2E fixture', () => {
+  it('places the debug store at the Tauri app-data root', () => {
+    const workflow = readFileSync(
+      new URL('../.github/workflows/ci.yml', import.meta.url),
+      'utf8',
+    )
+    expect(workflow).toContain(
+      'Copy-Item test\\e2e\\store.dat (Join-Path $appRoot \'.store.dev.dat\')',
+    )
+    expect(workflow).not.toContain(
+      'Copy-Item test\\e2e\\store.dat (Join-Path $appData \'.store.dev.dat\')',
+    )
+  })
+
   it('keeps the completed preinstall baseline synchronized with bundled presets', () => {
     const store = JSON.parse(
       readFileSync(new URL('./e2e/store.dat', import.meta.url), 'utf8'),
