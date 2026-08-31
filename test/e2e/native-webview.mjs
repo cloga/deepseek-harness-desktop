@@ -67,7 +67,8 @@ async function main() {
       async () => webdriver('POST', '/session', {
         capabilities: {
           alwaysMatch: {
-            browserName: 'wry',
+            'browserName': 'wry',
+            'tauri:options': { application },
           },
         },
       }),
