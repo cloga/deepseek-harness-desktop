@@ -213,52 +213,40 @@ pub async fn mount_harness_webview(
     let destination = url
         .parse()
         .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?;
-    let builder = tauri::webview::WebviewBuilder::new(
-        "harness",
-        WebviewUrl::External(
-            "about:blank"
-                .parse()
-                .expect("about:blank must remain a valid URL"),
-        ),
-    )
-    .initialization_script(crate::desktop::auth_probe::AUTH_TOP_LEVEL_PROBE_JS)
-    .on_navigation(move |target| {
-        if target.scheme() == "dsh-auth-probe" {
-            if target.host_str() != Some("127.0.0.1") {
+    let builder = tauri::webview::WebviewBuilder::new("harness", WebviewUrl::External(destination))
+        .initialization_script(crate::desktop::auth_probe::AUTH_TOP_LEVEL_PROBE_JS)
+        .on_navigation(move |target| {
+            if target.scheme() == "dsh-auth-probe" {
+                if target.host_str() != Some("127.0.0.1") {
+                    return false;
+                }
+                let status = target
+                    .query_pairs()
+                    .find_map(|(name, value)| (name == "status").then(|| value.parse::<u16>().ok()))
+                    .flatten()
+                    .unwrap_or(0);
+                log::info!("[harness-webview] protected probe completed: status={status}");
+                let _ = event_app.emit(
+                    "harness-auth-probe",
+                    HarnessAuthProbePayload {
+                        origin: event_origin.clone(),
+                        status,
+                    },
+                );
                 return false;
             }
-            let status = target
-                .query_pairs()
-                .find_map(|(name, value)| (name == "status").then(|| value.parse::<u16>().ok()))
-                .flatten()
-                .unwrap_or(0);
-            log::info!("[harness-webview] protected probe completed: status={status}");
-            let _ = event_app.emit(
-                "harness-auth-probe",
-                HarnessAuthProbePayload {
-                    origin: event_origin.clone(),
-                    status,
-                },
-            );
-            return false;
-        }
-        target.as_str() == "about:blank"
-            || target.scheme() == "http"
+            target.scheme() == "http"
                 && target.host_str() == Some("127.0.0.1")
                 && (target.port() == relay_port || target.port() == harness_port)
-    });
-    let webview = window
+        });
+    window
         .add_child(
             builder,
             tauri::LogicalPosition::new(-1.0, -1.0),
             tauri::LogicalSize::new(1.0, 1.0),
         )
         .map_err(|_| "HARNESS_WEBVIEW_CREATE_FAILED: child WebView creation failed".to_string())?;
-    log::info!("[harness-webview] child created");
-    webview.navigate(destination).map_err(|_| {
-        "HARNESS_WEBVIEW_NAVIGATE_FAILED: child WebView navigation failed".to_string()
-    })?;
-    log::info!("[harness-webview] navigation submitted");
+    log::info!("[harness-webview] child created with initial navigation");
     Ok(())
 }
 
@@ -633,6 +621,13 @@ mod tests {
             error,
             "HARNESS_AUTH_URL_REJECTED: expected 127.0.0.1 loopback URL"
         );
+    }
+
+    #[test]
+    fn child_webview_uses_initial_navigation_instead_of_racy_post_create_navigation() {
+        let source = include_str!("system_os.rs");
+        assert!(source.contains("WebviewUrl::External(destination)"));
+        assert!(!source.contains("webview.navigate(destination)"));
     }
 
     #[test]
