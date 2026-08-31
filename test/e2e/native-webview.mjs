@@ -61,6 +61,7 @@ async function main() {
     const session = await webdriver('POST', '/session', {
       capabilities: {
         alwaysMatch: {
+          'browserName': 'wry',
           'tauri:options': { application },
         },
       },

@@ -180,7 +180,10 @@ jobs:
           if (-not $edgeDriver) {
             throw 'msedgedriver.exe is not available on the Windows runner'
           }
-          $driver = Start-Process tauri-driver -ArgumentList '--native-driver', $edgeDriver -PassThru
+          $driverOut = Join-Path $env:RUNNER_TEMP 'tauri-driver.stdout.log'
+          $driverErr = Join-Path $env:RUNNER_TEMP 'tauri-driver.stderr.log'
+          $driver = Start-Process tauri-driver -ArgumentList '--native-driver', $edgeDriver -PassThru `
+            -RedirectStandardOutput $driverOut -RedirectStandardError $driverErr
           try {
             for ($attempt = 0; $attempt -lt 60; $attempt++) {
               if (Test-NetConnection 127.0.0.1 -Port 4444 -InformationLevel Quiet -WarningAction SilentlyContinue) {
@@ -195,4 +198,6 @@ jobs:
           }
           finally {
             Stop-Process -Id $driver.Id -ErrorAction SilentlyContinue
+            Get-Content $driverOut -ErrorAction SilentlyContinue
+            Get-Content $driverErr -ErrorAction SilentlyContinue
           }
