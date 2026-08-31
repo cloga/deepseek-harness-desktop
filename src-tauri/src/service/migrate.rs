@@ -176,7 +176,7 @@ fn src_newer(src: &Path, dst: &Path) -> bool {
 ///
 /// 递归遍历目录：只处理名为 `node_modules` 的目录（查其下 `.modules.yaml`，不
 /// 深入 node_modules 内部的海量子目录）。best-effort，删除失败仅告警。
-fn purge_carried_pnpm_metadata(root: &Path) {
+pub(crate) fn purge_carried_pnpm_metadata(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
