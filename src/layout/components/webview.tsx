@@ -11,7 +11,12 @@ import { PluginRecovery } from '@/components/plugin-recovery'
 import { useDesktopZoom } from '@/hooks/use-desktop-zoom'
 import { useIframeShim } from '@/hooks/use-iframe-shim'
 import { store } from '@/store'
-import { hasBlockingOverlay, shouldShowNativeWebview } from '@/utils/native-webview-visibility'
+import {
+  fitNativeWebviewAroundOverlays,
+  floatingOverlayBounds,
+  hasBlockingOverlay,
+  shouldShowNativeWebview,
+} from '@/utils/native-webview-visibility'
 import { Loadable } from './loadable'
 import { Navbar } from './navbar'
 import { PreinstallSetup } from './preinstall-setup'
@@ -75,7 +80,6 @@ export function Webview() {
     let disposed = false
     let mounted = false
     let mounting = false
-    let observer: ResizeObserver | undefined
 
     async function syncNativeWebview() {
       const element = nativeWebviewRef.current
@@ -88,11 +92,8 @@ export function Webview() {
         width: bounds.width,
         height: bounds.height,
       }
-      if (mounted || mounting) {
-        if (mounted)
-          await invoke('set_harness_webview_bounds', geometry)
+      if (mounted || mounting)
         return
-      }
       mounting = true
       try {
         await ensureHarnessAuthProbeListener()
@@ -114,16 +115,10 @@ export function Webview() {
 
     if (nativeWebview && serviceHealthy) {
       void syncNativeWebview()
-      observer = new ResizeObserver(() => {
-        void syncNativeWebview()
-      })
-      if (nativeWebviewRef.current !== null)
-        observer.observe(nativeWebviewRef.current)
     }
 
     return () => {
       disposed = true
-      observer?.disconnect()
       if (mounted)
         void invoke('close_harness_webview')
     }
@@ -131,23 +126,53 @@ export function Webview() {
   useEffect(() => {
     if (!nativeWebview)
       return
-    let shown: boolean | undefined
-    function syncVisibility() {
+    let revision = 0
+    let lastState = ''
+    async function syncVisibility() {
+      const currentRevision = ++revision
+      const element = nativeWebviewRef.current
+      if (element === null)
+        return
       const next = shouldShowNativeWebview(
         nativeWebview,
         serviceHealthy,
         iframeLoaded,
         hasBlockingOverlay(document),
       )
-      if (next === shown)
+      const base = element.getBoundingClientRect()
+      const bounds = fitNativeWebviewAroundOverlays(base, floatingOverlayBounds(document))
+      const state = JSON.stringify({ next, bounds })
+      if (state === lastState)
         return
-      shown = next
-      void invoke(next ? 'show_harness_webview' : 'hide_harness_webview')
+      lastState = state
+      if (!next) {
+        await invoke('hide_harness_webview')
+        return
+      }
+      await invoke('set_harness_webview_bounds', { ...bounds })
+      if (currentRevision === revision)
+        await invoke('show_harness_webview')
     }
-    const observer = new MutationObserver(syncVisibility)
-    observer.observe(document.body, { childList: true, subtree: true })
-    syncVisibility()
-    return () => observer.disconnect()
+    function scheduleVisibilitySync() {
+      void syncVisibility().catch((error) => {
+        console.error('[Harness] failed to synchronize native WebView visibility:', error)
+      })
+    }
+    const mutationObserver = new MutationObserver(() => {
+      scheduleVisibilitySync()
+    })
+    const resizeObserver = new ResizeObserver(() => {
+      scheduleVisibilitySync()
+    })
+    mutationObserver.observe(document.body, { childList: true, subtree: true })
+    if (nativeWebviewRef.current !== null)
+      resizeObserver.observe(nativeWebviewRef.current)
+    scheduleVisibilitySync()
+    return () => {
+      revision++
+      mutationObserver.disconnect()
+      resizeObserver.disconnect()
+    }
   }, [iframeLoaded, nativeWebview, serviceHealthy])
   if (status === 'error') {
     return (
