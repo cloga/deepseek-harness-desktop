@@ -17,7 +17,7 @@ async function webdriver(method, path, body) {
   return payload.value
 }
 
-async function waitFor(callback, label, timeout = 60_000) {
+async function waitFor(callback, label, timeout = 60_000, shouldRetry = () => true) {
   const deadline = Date.now() + timeout
   let lastError
   while (Date.now() < deadline) {
@@ -27,6 +27,8 @@ async function waitFor(callback, label, timeout = 60_000) {
         return value
     }
     catch (error) {
+      if (!shouldRetry(error))
+        throw error
       lastError = error
     }
     await new Promise(resolve => setTimeout(resolve, 250))
@@ -58,14 +60,19 @@ async function surfaceBounds(surface) {
 async function main() {
   try {
     assert.ok(application, 'DSH_E2E_APPLICATION is required')
-    const session = await webdriver('POST', '/session', {
-      capabilities: {
-        alwaysMatch: {
-          'browserName': 'wry',
-          'tauri:options': { application },
+    const session = await waitFor(
+      async () => webdriver('POST', '/session', {
+        capabilities: {
+          alwaysMatch: {
+            'browserName': 'wry',
+            'tauri:options': { application },
+          },
         },
-      },
-    })
+      }),
+      'WebDriver session creation',
+      90_000,
+      error => error instanceof TypeError,
+    )
     sessionId = session.sessionId
 
     const surface = await waitFor(async () => {
