@@ -47,4 +47,18 @@ describe('native WebView visibility', () => {
       floatingOverlayBounds(root),
     )).toEqual({ x: 0, y: 300, width: 1000, height: 500 })
   })
+
+  it('projects DOMRect prototype getters into enumerable native bounds', () => {
+    const dimensions = { x: 12, y: 44, width: 960, height: 720 }
+    const domRectLike = Object.create({}, Object.fromEntries(
+      Object.entries(dimensions).map(([key, value]) => [
+        key,
+        { configurable: true, enumerable: false, get: () => value },
+      ]),
+    ))
+
+    const fitted = fitNativeWebviewAroundOverlays(domRectLike, [])
+    expect(fitted).toEqual(dimensions)
+    expect(Object.keys(fitted)).toEqual(['x', 'y', 'width', 'height'])
+  })
 })

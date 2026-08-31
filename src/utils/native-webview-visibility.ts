@@ -36,7 +36,12 @@ export function fitNativeWebviewAroundOverlays(
   base: NativeWebviewBounds,
   overlays: NativeWebviewBounds[],
 ): NativeWebviewBounds {
-  let fitted = { ...base }
+  let fitted = {
+    x: base.x,
+    y: base.y,
+    width: base.width,
+    height: base.height,
+  }
   for (const overlay of overlays) {
     const right = fitted.x + fitted.width
     const bottom = fitted.y + fitted.height
