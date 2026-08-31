@@ -1,11 +1,12 @@
 //! 内置插件启动自愈：随安装包分发的内置插件（条目位于
-//! `internal-plugins.json`，产物目录 `resources/internal-plugins/<id>` 由构建期
-//! `scripts/prebuild.ts` 拉取）在服务启动前核对「是否已安装 + 安装路径是否仍
-//! 指向当前捆绑目录」：未安装 / 路径不正确 / 用户卸载后残留缺失 → 一律走常规
-//! 安装流程强制重装，保证桌面外壳依赖的桥接层（如 dsh-tauri）随包可用。
+//! `internal-plugins.json`，产物目录 `resources/node_modules/<name>` 由构建期
+//! `scripts/build-plugins.ts` 的 `pnpm deploy` 打包）在服务启动前核对
+//! 「是否已安装 + 安装路径是否仍指向当前捆绑目录」：未安装 / 路径不正确 / 用户
+//! 卸载后残留缺失 → 一律走常规安装流程强制重装，保证桌面外壳依赖的桥接层
+//! （如 dsh-tauri）随包可用。
 //!
-//! debug 构建可用仓库根 `.env` 的 `DEV_INTERNAL_PLUGINS_DIR` 把安装目标指到
-//! 本地插件源码（热更新迭代，见 [`super::preset::bundled_plugin_dir`]）。
+//! debug 构建会自动发现仓库根 `packages/*` 中非私有且含 `dsh` 对象的包，把安装
+//! 目标指到本地插件源码（热更新迭代，见 [`super::preset::bundled_plugin_dir`]）。
 //!
 //! 为什么放在启动而非安装流程：安装是用户主动行为，内置插件是应用自身的完整性
 //! 要求——用户怎么卸载、何时卸载都不影响下次启动自动恢复，无需任何用户操作。
@@ -35,7 +36,7 @@ mod manifest;
 /// 核对并强制安装缺失/路径不正确/被卸载的内置插件，在服务进程启动前调用。
 ///
 /// 最佳努力：任何失败只记告警（调用方不阻断启动）；捆绑目录缺失（开发环境未跑
-/// prebuild）时跳过，交由常规引导流程处理；批量待装列表为空则不触发任何安装。
+/// build:plugins）时跳过，交由常规引导流程处理；批量待装列表为空则不触发任何安装。
 /// 内置插件阶段事件载荷：除开始/结束外定期发送 heartbeat，令前端只在安装确实
 /// 无进展时触发 inactivity deadline，同时仍受绝对上限约束。
 #[derive(serde::Serialize, Clone)]
@@ -529,11 +530,11 @@ async fn ensure_inner(
     let mut need: Vec<(String, String, PathBuf)> = Vec::new();
     for preset in internal {
         let Some(bundled) = bundled_plugin_dir(app_handle, &preset.id) else {
-            // 未找到内置插件目录：release 说明构建期 prebuild 未拉取（发布缺陷，
-            // 由 prebuild 响亮失败）；debug 可用 .env 的 DEV_INTERNAL_PLUGINS_DIR
-            // 指向本地源码目录，未配置/缺 id 时跳过（「找不到则不装」）。
+            // 未找到内置插件目录：release 说明构建期 build:plugins 未打包（发布
+            // 缺陷，由 build:plugins 响亮失败）；debug 自动发现 packages/* 中非私有
+            // 且含 dsh 对象的包，未命中时跳过（「找不到则不装」）。
             log::warn!(
-                "INTERNAL_PLUGIN_BUNDLE_MISSING: {}（release 需构建期 prebuild；debug 可配 .env DEV_INTERNAL_PLUGINS_DIR）",
+                "INTERNAL_PLUGIN_BUNDLE_MISSING: {}（release 需构建期 build:plugins；debug 无匹配的 packages/* 包）",
                 preset.id
             );
             continue;
@@ -586,16 +587,31 @@ async fn ensure_inner(
 
     // 必须等全部检查完成后再删除旧入口：多个 internal id 可能映射到同一 npm 包，
     // 边遍历边删除会让后续原本健康的别名被误判缺失。统一去重后只删一次。
+    //
+    // 幂等跳过：仅删除「真的损坏/缺失」的入口。依赖声明缺失（dep_ok=false）但链接本身
+    // 健康（link_ok=true）时仍会进入 need，此时绝不要 delete + recreate——Windows 下
+    // 重建 junction/reparse point 后立即回读会随机 `-4094 [UNKNOWN] unknown error`
+    // （issue #264），一处失败即令整个安装放弃、`link:` 依赖不落盘，下次启动又判定
+    // dep_ok=false 再装，形成不可恢复的启动死循环。保留健康链接，交给本轮 `dsh plugin
+    // add` 重写依赖声明即可（pnpm 处理 link: 依赖时会自行覆盖旧入口）。
     let mut entries = HashSet::new();
     for (_, _, entry) in &need {
-        if entries.insert(entry.clone()) {
-            remove_stale_plugin_entry(entry).map_err(|e| {
-                format!(
-                    "INTERNAL_PLUGIN_STALE_ENTRY_REMOVE_FAILED: {}: {e}",
-                    entry.display()
-                )
-            })?;
+        if !entries.insert(entry.clone()) {
+            continue;
         }
+        if internal_plugin_entry_is_ready(entry) {
+            log::info!(
+                "INTERNAL_PLUGIN_ENTRY_HEALTHY: keeping intact link {} (no delete + recreate)",
+                entry.display()
+            );
+            continue;
+        }
+        remove_stale_plugin_entry(entry).map_err(|e| {
+            format!(
+                "INTERNAL_PLUGIN_STALE_ENTRY_REMOVE_FAILED: {}: {e}",
+                entry.display()
+            )
+        })?;
     }
     // 复用常规安装编排（环境准备/补齐 pnpm/`dsh plugin add file:<dir>`）；
     // 启动阶段无持有进程，install 内部不会停服务。失败同样交给调用方告警。

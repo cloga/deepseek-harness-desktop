@@ -4,6 +4,7 @@ node_modules
 !test/e2e/local-core/node_modules/@deepseek-ai/dsh/
 !test/e2e/local-core/node_modules/@deepseek-ai/dsh/**
 dist
+.build-plugins-tmp
 src-tauri/target
 src-tauri/gen
 src-tauri/resources/node
