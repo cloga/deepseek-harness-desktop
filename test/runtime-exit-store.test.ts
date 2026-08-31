@@ -252,4 +252,53 @@ describe('runtime exit store', () => {
     expect(finalized).toEqual([false, true])
     expect(harness.serviceHealthy).toBe(true)
   })
+
+  it('reuses the clean native session after a completed handoff without reclaiming the token', async () => {
+    let preparations = 0
+    const finalized: boolean[] = []
+    invoke.mockImplementation(async (command: string, args?: { success?: boolean }) => {
+      if (command === 'launch_harness')
+        return 6
+      if (command === 'get_runtime_info')
+        return { service_url: 'http://127.0.0.1:31415' }
+      if (command === 'proxy_health_check')
+        return 'Healthy'
+      if (command === 'prepare_harness_webview') {
+        preparations++
+        return preparations === 1
+          ? {
+              url: 'http://127.0.0.1:31416/dsh-auth/6/44',
+              verify_auth: true,
+              claim: { generation: 6, pid: 44 },
+              probe_origin: 'http://127.0.0.1:31415',
+            }
+          : {
+              url: 'http://127.0.0.1:31415',
+              verify_auth: true,
+              claim: null,
+              probe_origin: 'http://127.0.0.1:31415',
+            }
+      }
+      if (command === 'finish_harness_webview_auth') {
+        finalized.push(args?.success === true)
+        return undefined
+      }
+      if (command === 'close_harness_webview')
+        return undefined
+      throw new Error(`unexpected invoke: ${command}`)
+    })
+
+    const first = harness.launchAndWait()
+    await vi.waitFor(() => expect(preparations).toBe(1))
+    harness.reportIframeAuthProbe('http://127.0.0.1:31415', 200)
+    await first
+
+    const retry = harness.launchAndWait()
+    await vi.waitFor(() => expect(preparations).toBe(2))
+    harness.reportIframeAuthProbe('http://127.0.0.1:31415', 200)
+    await retry
+
+    expect(finalized).toEqual([true])
+    expect(harness.serviceHealthy).toBe(true)
+  })
 })

@@ -163,11 +163,7 @@ fn claim_harness_launch(
         HarnessLaunchConsumer::Browser => owner.browser_pending,
     };
     if !pending {
-        return if owner.authenticated_port.is_none() {
-            Ok(None)
-        } else {
-            Err("HARNESS_AUTH_HANDOFF_USED: authentication handoff was already used".into())
-        };
+        return Ok(None);
     }
     if owner.in_flight.is_some() {
         return Err("HARNESS_AUTH_HANDOFF_BUSY: another authentication delivery is active".into());
@@ -187,6 +183,18 @@ fn claim_harness_launch(
         url: value.clone(),
         consumer,
     }))
+}
+
+pub fn harness_webview_handoff_completed(port: u16, generation: u64) -> bool {
+    let state = harness_launch_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state.owner.as_ref().is_some_and(|owner| {
+        owner.generation == generation
+            && owner.authenticated_port == Some(port)
+            && !owner.webview_pending
+            && owner.in_flight != Some(HarnessLaunchConsumer::Webview)
+    })
 }
 
 pub fn claim_harness_webview_launch(
@@ -817,7 +825,10 @@ mod tests {
             .expect("webview claim");
         assert_eq!(webview.url(), "http://127.0.0.1:3083/?token=secret-value");
         assert!(finish_harness_launch_claim(&webview, true));
-        assert!(claim_harness_webview_launch(3083, generation).is_err());
+        assert!(claim_harness_webview_launch(3083, generation)
+            .unwrap()
+            .is_none());
+        assert!(harness_webview_handoff_completed(3083, generation));
         let browser = claim_harness_browser_launch(3083)
             .unwrap()
             .expect("browser claim");

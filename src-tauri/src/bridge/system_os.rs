@@ -59,11 +59,13 @@ pub async fn prepare_harness_webview(
     let Some(claim) =
         crate::service::workflow::utils::claim_harness_webview_launch(port, generation)?
     else {
+        let reuse_authenticated_webview =
+            crate::service::workflow::utils::harness_webview_handoff_completed(port, generation);
         return Ok(HarnessWebviewPreparation {
             url: service_url,
-            verify_auth: false,
+            verify_auth: reuse_authenticated_webview,
             claim: None,
-            probe_origin: None,
+            probe_origin: reuse_authenticated_webview.then(|| config::get_dsh_service_url(port)),
         });
     };
     match prepare_claimed_harness_webview(&claim).await {
@@ -173,12 +175,6 @@ pub async fn mount_harness_webview(
     }
     let relay_url = reqwest::Url::parse(&url)
         .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?;
-    if relay_url.scheme() != "http"
-        || relay_url.host_str() != Some("127.0.0.1")
-        || !relay_url.path().starts_with("/dsh-auth/")
-    {
-        return Err("HARNESS_WEBVIEW_URL_REJECTED: expected native relay URL".into());
-    }
     let expected_origin = reqwest::Url::parse(&probe_origin)
         .map_err(|_| "HARNESS_WEBVIEW_ORIGIN_INVALID: probe origin is invalid".to_string())?;
     if expected_origin.scheme() != "http"
@@ -186,6 +182,16 @@ pub async fn mount_harness_webview(
         || expected_origin.origin().ascii_serialization() != probe_origin
     {
         return Err("HARNESS_WEBVIEW_ORIGIN_REJECTED: expected 127.0.0.1 origin".into());
+    }
+    let is_relay = relay_url.path().starts_with("/dsh-auth/");
+    let is_clean_core = relay_url.origin() == expected_origin.origin()
+        && relay_url.path() == "/"
+        && relay_url.query_pairs().all(|(name, _)| name == "t");
+    if relay_url.scheme() != "http"
+        || relay_url.host_str() != Some("127.0.0.1")
+        || (!is_relay && !is_clean_core)
+    {
+        return Err("HARNESS_WEBVIEW_URL_REJECTED: expected native relay or clean core URL".into());
     }
     let relay_port = relay_url.port();
     let harness_port = expected_origin.port();
