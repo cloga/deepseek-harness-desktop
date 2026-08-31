@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod autostart;
 pub mod builder;
 pub mod compat;

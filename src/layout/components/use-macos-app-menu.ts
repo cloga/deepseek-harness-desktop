@@ -6,6 +6,7 @@ interface MacOSAppMenuActions {
   openAbout: () => void
   copyRunLogs: () => void
   checkUpdate: () => void
+  restartHarness: () => void
 }
 
 interface UseMacOSAppMenuOptions extends MacOSAppMenuActions {
@@ -22,14 +23,16 @@ export function useMacOSAppMenu({
   openAbout,
   copyRunLogs,
   checkUpdate,
+  restartHarness,
 }: UseMacOSAppMenuOptions) {
   const actionsRef = useRef<MacOSAppMenuActions>({
     openConfig,
     openAbout,
     copyRunLogs,
     checkUpdate,
+    restartHarness,
   })
-  actionsRef.current = { openConfig, openAbout, copyRunLogs, checkUpdate }
+  actionsRef.current = { openConfig, openAbout, copyRunLogs, checkUpdate, restartHarness }
 
   useEffect(() => {
     if (!enabled)
@@ -53,6 +56,9 @@ export function useMacOSAppMenu({
               break
             case 'desktop-check-update':
               actionsRef.current.checkUpdate()
+              break
+            case 'desktop-restart':
+              actionsRef.current.restartHarness()
               break
           }
         })

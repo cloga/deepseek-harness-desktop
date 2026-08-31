@@ -1,3 +1,4 @@
+import type { AppConfig } from '@/hooks/use-app-config'
 import { ArrowRotateRight, ArrowUpRightFromSquare, ChevronRight, Copy, Folder, Power, TrashBin } from '@gravity-ui/icons'
 import { Button, Chip, Description, Input, Link, ListBox, Select, Spinner, Surface, Switch } from '@heroui/react'
 import { useMutation, useQuery } from '@tanstack/react-query'
@@ -7,9 +8,11 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
 import { useStore } from 'valtio-define'
+import { useAppConfig } from '@/hooks/use-app-config'
 import { store } from '@/store'
 import { writeClipboardText } from '@/utils/clipboard'
 import { toast } from '@/utils/toast'
+import { ConfigCloseAction } from './config-close-action'
 import { ConfigLaunchOnLogin } from './config-launch-on-login'
 import { Info } from './info'
 
@@ -35,12 +38,6 @@ export interface CliLinkStatus {
   user_dsh_preserved: boolean
   bin_dir: string
   shim_path: string
-}
-export interface AppConfig {
-  port: number
-  auto_start: boolean
-  cli_link_enabled: boolean
-  zoom_factor: number
 }
 
 export function ConfigDebug() {
@@ -75,10 +72,7 @@ export function ConfigDebug() {
     }
   }, [refreshInfo])
 
-  const { data: config, refetch: refreshConfig } = useQuery({
-    queryKey: ['config'],
-    queryFn: () => invoke<AppConfig>('get_app_config'),
-  })
+  const { data: config, refetch: refreshConfig } = useAppConfig()
   const port = portInput ?? config?.port ?? 3080
 
   const { data: cliStatus, refetch: refreshCliStatus } = useQuery({
@@ -312,6 +306,7 @@ export function ConfigDebug() {
       <div className="border-t border-line/30" />
       <div className="space-y-1.5">
         <ConfigLaunchOnLogin />
+        <ConfigCloseAction />
         <div>
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-ink">{t('ui.cli_link_enabled')}</span>
