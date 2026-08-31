@@ -833,7 +833,7 @@ mod tests {
             .unwrap()
             .expect("browser claim");
         assert!(finish_harness_launch_claim(&browser, true));
-        assert!(claim_harness_browser_launch(3083).is_err());
+        assert!(claim_harness_browser_launch(3083).unwrap().is_none());
         assert!(!has_authenticated_harness_launch(3080));
         clear_harness_launch_url();
     }
