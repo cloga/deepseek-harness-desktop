@@ -77,10 +77,21 @@ async function main() {
     )
     sessionId = session.sessionId
 
-    const surface = await waitFor(async () => {
-      const candidate = await find('css selector', '[data-testid="harness-native-surface"]')
-      return await attribute(candidate, 'data-loaded') === 'true' ? candidate : undefined
-    }, 'authenticated native surface')
+    let surface
+    try {
+      surface = await waitFor(async () => {
+        const candidate = await find('css selector', '[data-testid="harness-native-surface"]')
+        return await attribute(candidate, 'data-loaded') === 'true' ? candidate : undefined
+      }, 'authenticated native surface')
+    }
+    catch (error) {
+      const currentUrl = await webdriver('GET', `/session/${sessionId}/url`).catch(() => 'unavailable')
+      const title = await webdriver('GET', `/session/${sessionId}/title`).catch(() => 'unavailable')
+      const handles = await webdriver('GET', `/session/${sessionId}/window/handles`).catch(() => [])
+      throw new Error(
+        `${error instanceof Error ? error.message : error}; shell=${JSON.stringify({ currentUrl, title, handles })}`,
+      )
+    }
     const full = await surfaceBounds(surface)
     assert.ok(full.width > 500 && full.height > 300, `unexpected initial bounds: ${JSON.stringify(full)}`)
     const desktopLog = join(

@@ -148,6 +148,7 @@ async fn start_harness_auth_relay(
             .and_then(|line| line.split_whitespace().nth(1))
             .and_then(|target| target.split('?').next());
         let response = if request_path == Some(expected_path.as_str()) {
+            log::info!("[harness-webview] auth relay request accepted");
             format!(
                 "HTTP/1.1 303 See Other\r\nLocation: {launch_url}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
@@ -195,6 +196,9 @@ pub async fn mount_harness_webview(
     }
     let relay_port = relay_url.port();
     let harness_port = expected_origin.port();
+    log::info!(
+        "[harness-webview] mount requested: relay={is_relay}, origin={probe_origin}, bounds={x},{y},{width},{height}"
+    );
 
     if let Some(existing) = app_handle.get_webview("harness") {
         existing
@@ -228,6 +232,7 @@ pub async fn mount_harness_webview(
                 .find_map(|(name, value)| (name == "status").then(|| value.parse::<u16>().ok()))
                 .flatten()
                 .unwrap_or(0);
+            log::info!("[harness-webview] protected probe completed: status={status}");
             let _ = event_app.emit(
                 "harness-auth-probe",
                 HarnessAuthProbePayload {
@@ -249,9 +254,12 @@ pub async fn mount_harness_webview(
             tauri::LogicalSize::new(1.0, 1.0),
         )
         .map_err(|_| "HARNESS_WEBVIEW_CREATE_FAILED: child WebView creation failed".to_string())?;
-    webview
-        .navigate(destination)
-        .map_err(|_| "HARNESS_WEBVIEW_NAVIGATE_FAILED: child WebView navigation failed".to_string())
+    log::info!("[harness-webview] child created");
+    webview.navigate(destination).map_err(|_| {
+        "HARNESS_WEBVIEW_NAVIGATE_FAILED: child WebView navigation failed".to_string()
+    })?;
+    log::info!("[harness-webview] navigation submitted");
+    Ok(())
 }
 
 #[tauri::command]
