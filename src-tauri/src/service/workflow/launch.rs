@@ -328,6 +328,11 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     if let Err(e) = crate::service::patch::session::apply(&app_handle) {
         log::warn!("SessionStore.remove patch failed: {e}");
     }
+    // 一个损坏的 Zstandard 会话 artifact 不应让整个 workspace loader 退出。只对
+    // 上游明确报告的 header corruption 跳过目录项并记录路径；文件保持原样。
+    if let Err(e) = crate::service::patch::session_catalog::apply(&app_handle) {
+        log::warn!("session catalog corruption isolation patch failed: {e}");
+    }
     // worktree 会话以隔离 cwd 执行，但产品归属仍是源 Workspace；放宽上游显式
     // attach 的 cwd 相等约束，其他 cwd 有效性校验保持不变。最佳努力且幂等。
     if let Err(e) = crate::service::patch::workspace::apply(&app_handle) {
