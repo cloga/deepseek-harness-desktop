@@ -92,7 +92,7 @@ async fn prepare_claimed_harness_webview(
     })
 }
 
-/// 将受信的 127.0.0.1 启动地址规范为 WebView 使用的 localhost 地址。
+/// 校验并保留受信的字面 127.0.0.1 启动地址，避免 localhost 落到竞争的 IPv6 监听器。
 fn prepare_harness_launch_urls(launch_url: &str) -> Result<(String, String), String> {
     let mut exchange_url = reqwest::Url::parse(launch_url)
         .map_err(|error| format!("HARNESS_AUTH_URL_INVALID: {error}"))?;
@@ -107,9 +107,6 @@ fn prepare_harness_launch_urls(launch_url: &str) -> Result<(String, String), Str
     {
         return Err("HARNESS_AUTH_URL_REJECTED: expected 127.0.0.1 loopback URL".into());
     }
-    exchange_url
-        .set_host(Some("localhost"))
-        .map_err(|error| format!("HARNESS_AUTH_HOST_INVALID: {error}"))?;
     let mut clean_url = exchange_url.clone();
     clean_url.set_query(None);
     clean_url.set_fragment(None);
@@ -158,7 +155,7 @@ async fn start_harness_auth_relay(
         let _ = stream.write_all(response.as_bytes()).await;
         let _ = stream.shutdown().await;
     });
-    Ok(format!("http://localhost:{port}{path}"))
+    Ok(format!("http://127.0.0.1:{port}{path}"))
 }
 
 #[tauri::command]
@@ -174,7 +171,7 @@ pub async fn mount_harness_webview(
     let relay_url = reqwest::Url::parse(&url)
         .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?;
     if relay_url.scheme() != "http"
-        || relay_url.host_str() != Some("localhost")
+        || relay_url.host_str() != Some("127.0.0.1")
         || !relay_url.path().starts_with("/dsh-auth/")
     {
         return Err("HARNESS_WEBVIEW_URL_REJECTED: expected native relay URL".into());
@@ -182,10 +179,10 @@ pub async fn mount_harness_webview(
     let expected_origin = reqwest::Url::parse(&probe_origin)
         .map_err(|_| "HARNESS_WEBVIEW_ORIGIN_INVALID: probe origin is invalid".to_string())?;
     if expected_origin.scheme() != "http"
-        || expected_origin.host_str() != Some("localhost")
+        || expected_origin.host_str() != Some("127.0.0.1")
         || expected_origin.origin().ascii_serialization() != probe_origin
     {
-        return Err("HARNESS_WEBVIEW_ORIGIN_REJECTED: expected localhost origin".into());
+        return Err("HARNESS_WEBVIEW_ORIGIN_REJECTED: expected 127.0.0.1 origin".into());
     }
     let relay_port = relay_url.port();
     let harness_port = expected_origin.port();
@@ -210,6 +207,9 @@ pub async fn mount_harness_webview(
     .initialization_script(crate::desktop::auth_probe::AUTH_TOP_LEVEL_PROBE_JS)
     .on_navigation(move |target| {
         if target.scheme() == "dsh-auth-probe" {
+            if target.host_str() != Some("127.0.0.1") {
+                return false;
+            }
             let status = target
                 .query_pairs()
                 .find_map(|(name, value)| (name == "status").then(|| value.parse::<u16>().ok()))
@@ -225,7 +225,7 @@ pub async fn mount_harness_webview(
             return false;
         }
         target.scheme() == "http"
-            && target.host_str() == Some("localhost")
+            && target.host_str() == Some("127.0.0.1")
             && (target.port() == relay_port || target.port() == harness_port)
     });
     let webview = window
@@ -579,8 +579,8 @@ mod tests {
         let (launch_url, iframe_url) =
             prepare_harness_launch_urls("http://127.0.0.1:31415/?token=one-shot")
                 .expect("prepare launch URLs");
-        assert_eq!(launch_url, "http://localhost:31415/?token=one-shot");
-        assert_eq!(iframe_url, "http://localhost:31415/");
+        assert_eq!(launch_url, "http://127.0.0.1:31415/?token=one-shot");
+        assert_eq!(iframe_url, "http://127.0.0.1:31415/");
 
         let relay = start_harness_auth_relay(
             launch_url.clone(),

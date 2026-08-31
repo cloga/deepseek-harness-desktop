@@ -70,6 +70,7 @@ impl Installable for Dsh {
     }
     fn check_installed(&self, app: &AppHandle) -> bool {
         config::get_dsh_binary_path(app).exists()
+            && !crate::service::core::app_core_requires_repair(app)
     }
 }
 

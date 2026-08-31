@@ -29,7 +29,7 @@ fn request_status(port: u16, path: &str) -> u16 {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("negative control connect");
     write!(
         stream,
-        "POST {path} HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
     .expect("negative control request");
     let response = read_request(&mut stream);
@@ -41,12 +41,40 @@ fn request_status(port: u16, path: &str) -> u16 {
         .expect("numeric response status")
 }
 
+fn spawn_ipv6_competitor(port: u16, hit: Arc<AtomicBool>, done: Arc<AtomicBool>) {
+    let listener = TcpListener::bind(("::1", port)).expect("bind competing IPv6 listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set competing listener nonblocking");
+    std::thread::spawn(move || {
+        while !done.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    hit.store(true, Ordering::SeqCst);
+                    respond(&mut stream, "418 I'm a teapot", "", "");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("competing IPv6 listener failed: {error}"),
+            }
+        }
+    });
+}
+
 fn main() -> wry::Result<()> {
     let relay = TcpListener::bind("127.0.0.1:0").expect("bind relay");
     let core = TcpListener::bind("127.0.0.1:0").expect("bind core");
     let relay_port = relay.local_addr().expect("relay address").port();
     let core_port = core.local_addr().expect("core address").port();
     let authenticated = Arc::new(AtomicBool::new(false));
+    let ipv6_hit = Arc::new(AtomicBool::new(false));
+    spawn_ipv6_competitor(
+        relay_port,
+        Arc::clone(&ipv6_hit),
+        Arc::clone(&authenticated),
+    );
+    spawn_ipv6_competitor(core_port, Arc::clone(&ipv6_hit), Arc::clone(&authenticated));
 
     let core_authenticated = Arc::clone(&authenticated);
     std::thread::spawn(move || {
@@ -98,7 +126,7 @@ fn main() -> wry::Result<()> {
             &mut stream,
             "303 See Other",
             &format!(
-                "Location: http://localhost:{core_port}/?token=one-shot\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n"
+                "Location: http://127.0.0.1:{core_port}/?token=one-shot\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n"
             ),
             "",
         );
@@ -109,7 +137,7 @@ fn main() -> wry::Result<()> {
         .with_visible(false)
         .build(&event_loop)
         .expect("build window");
-    let builder = WebViewBuilder::new().with_url(format!("http://localhost:{relay_port}/auth"));
+    let builder = WebViewBuilder::new().with_url(format!("http://127.0.0.1:{relay_port}/auth"));
     #[cfg(target_os = "macos")]
     let _webview = builder.build(&window)?;
     #[cfg(target_os = "linux")]
@@ -123,10 +151,17 @@ fn main() -> wry::Result<()> {
     event_loop.run(move |_, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(50));
         if authenticated.load(Ordering::SeqCst) {
+            assert!(
+                !ipv6_hit.load(Ordering::SeqCst),
+                "IPv6 competitor received an authentication navigation"
+            );
             std::process::exit(0);
         }
         if Instant::now() >= deadline {
-            eprintln!("protected iframe API did not receive the WebView cookie");
+            eprintln!(
+                "protected API did not authenticate; IPv6 competitor hit={}",
+                ipv6_hit.load(Ordering::SeqCst)
+            );
             std::process::exit(1);
         }
     });

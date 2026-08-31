@@ -157,6 +157,16 @@ pub async fn start(app_handle: tauri::AppHandle) -> Result<(), String> {
         log::debug!("Harness not installed, skipping startup");
         return Ok(());
     }
+    if crate::service::core::active_source(&app_handle) == crate::service::core::CoreSource::App
+        && crate::service::core::app_core_requires_repair(&app_handle)
+    {
+        let mut setting = config::get_store_dat_setting(&app_handle);
+        setting.installed = false;
+        config::set_store_dat_setting(&app_handle, setting);
+        log::warn!("Managed Harness core requires verified reinstall before launch");
+        return Ok(());
+    }
+    crate::service::core::ensure_active_core_safe(&app_handle)?;
     if !node_binary_path.exists() || !dsh_binary_path.exists() {
         super::utils::clear_harness_launch_url();
         // Windows RedirectionGuard(448)：安装器继承的强制执行上下文永不自行恢复，
@@ -215,6 +225,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<u64, String> {
     let node_binary_path = config::get_node_binary_path(&app_handle);
     // 活动核心的 dsh 入口（本地核心优先，未检测到走预打包）
     let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle);
+    crate::service::core::ensure_active_core_safe(&app_handle)?;
 
     log::debug!("Checking Node.js path: {:?}", node_binary_path);
     if !node_binary_path.exists() {

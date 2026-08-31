@@ -186,10 +186,10 @@ describe('runtime exit store', () => {
         return 'Healthy'
       if (command === 'prepare_harness_webview') {
         return {
-          url: 'http://localhost:31415/dsh-auth/4/42',
+          url: 'http://127.0.0.1:31415/dsh-auth/4/42',
           verify_auth: true,
           claim: { generation: 4, pid: 42 },
-          probe_origin: 'http://localhost:31415',
+          probe_origin: 'http://127.0.0.1:31415',
         }
       }
       if (command === 'finish_harness_webview_auth')
@@ -200,9 +200,9 @@ describe('runtime exit store', () => {
     })
 
     const launch = harness.launchAndWait()
-    await vi.waitFor(() => expect(harness.iframeSrc).toContain('http://localhost:31415/'))
+    await vi.waitFor(() => expect(harness.iframeSrc).toContain('http://127.0.0.1:31415/'))
     expect(harness.status).toBe('ready')
-    harness.reportIframeAuthProbe('http://localhost:31415', 200)
+    harness.reportIframeAuthProbe('http://127.0.0.1:31415', 200)
     await launch
 
     expect(harness.serviceHealthy).toBe(true)
@@ -222,10 +222,10 @@ describe('runtime exit store', () => {
       if (command === 'prepare_harness_webview') {
         preparations++
         return {
-          url: `http://localhost:3141${preparations}/dsh-auth/5/43`,
+          url: `http://127.0.0.1:3141${preparations}/dsh-auth/5/43`,
           verify_auth: true,
           claim: { generation: 5, pid: 43 },
-          probe_origin: `http://localhost:3141${preparations}`,
+          probe_origin: `http://127.0.0.1:3141${preparations}`,
         }
       }
       if (command === 'finish_harness_webview_auth') {
@@ -241,12 +241,12 @@ describe('runtime exit store', () => {
 
     const first = harness.launchAndWait()
     await vi.waitFor(() => expect(preparations).toBe(1))
-    harness.reportIframeAuthProbe('http://localhost:31411', 401)
+    harness.reportIframeAuthProbe('http://127.0.0.1:31411', 401)
     await expect(first).rejects.toThrow('HARNESS_IFRAME_AUTH_REJECTED')
 
     const retry = harness.launchAndWait()
     await vi.waitFor(() => expect(preparations).toBe(2))
-    harness.reportIframeAuthProbe('http://localhost:31412', 200)
+    harness.reportIframeAuthProbe('http://127.0.0.1:31412', 200)
     await retry
 
     expect(finalized).toEqual([false, true])
