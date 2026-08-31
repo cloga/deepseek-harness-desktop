@@ -1,4 +1,8 @@
 node_modules
+!test/e2e/local-core/node_modules/
+!test/e2e/local-core/node_modules/@deepseek-ai/
+!test/e2e/local-core/node_modules/@deepseek-ai/dsh/
+!test/e2e/local-core/node_modules/@deepseek-ai/dsh/**
 dist
 src-tauri/target
 src-tauri/gen

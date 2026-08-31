@@ -310,6 +310,8 @@ export const harness = defineStore({
     iframeSrc: '',
     nativeWebview: false,
     nativeWebviewOrigin: '',
+    nativeWebviewMounted: false,
+    nativeWebviewBounds: { x: -1, y: -1, width: 1, height: 1 },
     iframeLoaded: false,
     iframeError: false,
     iframeKey: 0,
@@ -646,6 +648,8 @@ export const harness = defineStore({
       this.serviceHealthy = false
       this.nativeWebview = false
       this.nativeWebviewOrigin = ''
+      this.nativeWebviewMounted = false
+      this.nativeWebviewBounds = { x: -1, y: -1, width: 1, height: 1 }
       this.iframeLoaded = false
       this.iframeError = false
       this.startupPhase = 'process-boot'

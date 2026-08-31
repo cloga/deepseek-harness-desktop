@@ -121,3 +121,78 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo run --locked --example auth_webview_probe
         working-directory: src-tauri
+
+  native-webview-e2e:
+    name: Windows native WebView E2E
+    needs: pre_job
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
+    runs-on: windows-latest
+    env:
+      DSH_HOME: ${{ runner.temp }}\dsh-home
+      DSH_CLI_PATH: ${{ github.workspace }}\test\e2e\local-core\dsh.cmd
+      DSH_E2E_APPLICATION: ${{ github.workspace }}\src-tauri\target\release\deepseek-harness-desktop.exe
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build real desktop app
+        run: pnpm exec tauri build --no-bundle
+
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+
+      - name: Prepare isolated desktop state
+        shell: pwsh
+        run: |
+          $appData = Join-Path $env:APPDATA 'io.github.hairyf.deepseek-harness-desktop'
+          $managed = Join-Path $appData 'dependencies\dsh\node_modules\@deepseek-ai\dsh'
+          New-Item -ItemType Directory -Force -Path (Join-Path $managed 'lib') | Out-Null
+          Copy-Item test\e2e\store.dat (Join-Path $appData '.store.dat')
+          Copy-Item test\e2e\local-core\node_modules\@deepseek-ai\dsh\package.json $managed
+          Copy-Item test\e2e\local-core\node_modules\@deepseek-ai\dsh\lib\bin.js (Join-Path $managed 'lib\bin.js')
+          New-Item -ItemType Directory -Force -Path $env:DSH_HOME | Out-Null
+
+      - name: Run fresh native WebView flow
+        shell: pwsh
+        run: |
+          $edgeDriver = Get-Command msedgedriver.exe -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty Source
+          if (-not $edgeDriver) {
+            $edgeDriver = Get-ChildItem C:\SeleniumWebDrivers -Recurse -Filter msedgedriver.exe |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $edgeDriver) {
+            throw 'msedgedriver.exe is not available on the Windows runner'
+          }
+          $driver = Start-Process tauri-driver -ArgumentList '--native-driver', $edgeDriver -PassThru
+          try {
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              if (Test-NetConnection 127.0.0.1 -Port 4444 -InformationLevel Quiet -WarningAction SilentlyContinue) {
+                break
+              }
+              Start-Sleep -Milliseconds 250
+            }
+            pnpm run test:e2e:native
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
+          finally {
+            Stop-Process -Id $driver.Id -ErrorAction SilentlyContinue
+          }

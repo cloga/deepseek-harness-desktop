@@ -13,6 +13,7 @@
     "tauri": "tsx scripts/predev.ts",
     "release": "bumpp --pr",
     "test": "vitest",
+    "test:e2e:native": "node test/e2e/native-webview.mjs",
     "lint": "eslint",
     "knip": "knip",
     "lint:fix": "eslint . --fix",

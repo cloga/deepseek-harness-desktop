@@ -1,0 +1,13 @@
+{
+  "setting": {
+    "active_core": "local",
+    "active_profile": "web",
+    "auto_start": true,
+    "cli_link_enabled": false,
+    "installed": true,
+    "language": "zh",
+    "port": 31880,
+    "preinstall_done": true,
+    "zoom_factor": 1.0
+  }
+}

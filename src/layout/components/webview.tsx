@@ -54,6 +54,8 @@ export function Webview() {
     iframeLoaded,
     iframeSrc,
     nativeWebview,
+    nativeWebviewBounds,
+    nativeWebviewMounted,
     nativeWebviewOrigin,
     serviceUrl,
     recovery,
@@ -103,6 +105,7 @@ export function Webview() {
           probeOrigin: nativeWebviewOrigin,
         })
         mounted = true
+        store.harness.nativeWebviewMounted = true
       }
       catch (error) {
         console.error('[Harness] failed to mount native WebView:', error)
@@ -121,10 +124,11 @@ export function Webview() {
       disposed = true
       if (mounted)
         void invoke('close_harness_webview')
+      store.harness.nativeWebviewMounted = false
     }
   }, [iframeKey, iframeSrc, nativeWebview, nativeWebviewOrigin, serviceHealthy])
   useEffect(() => {
-    if (!nativeWebview)
+    if (!nativeWebview || !nativeWebviewMounted)
       return
     let lastState = ''
     let syncQueue = Promise.resolve()
@@ -147,6 +151,7 @@ export function Webview() {
         return
       lastState = state
       await invoke('set_harness_webview_bounds', { ...bounds })
+      store.harness.nativeWebviewBounds = bounds
     }
     function scheduleVisibilitySync() {
       syncQueue = syncQueue.then(syncVisibility).catch((error) => {
@@ -167,7 +172,7 @@ export function Webview() {
       mutationObserver.disconnect()
       resizeObserver.disconnect()
     }
-  }, [iframeLoaded, nativeWebview, serviceHealthy])
+  }, [iframeLoaded, nativeWebview, nativeWebviewMounted, serviceHealthy])
   if (status === 'error') {
     return (
       <main className="relative flex min-h-0 flex-1 flex-col bg-canvas">
@@ -217,7 +222,20 @@ export function Webview() {
         >
           <If
             cond={nativeWebview}
-            then={<div key={iframeKey} ref={nativeWebviewRef} className="h-full w-full bg-load-bg" />}
+            then={(
+              <div
+                key={iframeKey}
+                ref={nativeWebviewRef}
+                className="h-full w-full bg-load-bg"
+                data-testid="harness-native-surface"
+                data-loaded={iframeLoaded}
+                data-mounted={nativeWebviewMounted}
+                data-native-x={nativeWebviewBounds.x}
+                data-native-y={nativeWebviewBounds.y}
+                data-native-width={nativeWebviewBounds.width}
+                data-native-height={nativeWebviewBounds.height}
+              />
+            )}
             else={(
               <iframe
                 key={iframeKey}
