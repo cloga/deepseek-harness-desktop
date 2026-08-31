@@ -1,4 +1,4 @@
-//! 验证 macOS/Linux 真实 WebView 引擎会在跨站 iframe 中发送认证 cookie。
+//! 验证 macOS/Linux 真实 WebView 顶层导航可完成官方认证交换。
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -109,20 +109,7 @@ fn main() -> wry::Result<()> {
         .with_visible(false)
         .build(&event_loop)
         .expect("build window");
-    let builder = WebViewBuilder::new()
-        .with_custom_protocol("tauri".into(), move |_webview_id, _request| {
-            wry::http::Response::builder()
-                .header(wry::http::header::CONTENT_TYPE, "text/html")
-                .body(
-                    format!(
-                        "<!doctype html><iframe src=\"http://localhost:{relay_port}/auth\"></iframe>"
-                    )
-                    .into_bytes(),
-                )
-                .expect("custom protocol response")
-                .map(Into::into)
-        })
-        .with_url("tauri://localhost");
+    let builder = WebViewBuilder::new().with_url(format!("http://localhost:{relay_port}/auth"));
     #[cfg(target_os = "macos")]
     let _webview = builder.build(&window)?;
     #[cfg(target_os = "linux")]

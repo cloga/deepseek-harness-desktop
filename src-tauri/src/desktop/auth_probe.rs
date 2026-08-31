@@ -25,6 +25,29 @@ pub(crate) const AUTH_PROBE_JS: &str = r#"(function () {
   });
 })();"#;
 
+pub(crate) const AUTH_TOP_LEVEL_PROBE_JS: &str = r#"(function () {
+  if (window.top !== window) return;
+  if (location.protocol !== 'http:' || location.hostname !== 'localhost') return;
+  if (location.search !== '' || sessionStorage.getItem('dsh-desktop-auth-probed') === '1') return;
+  sessionStorage.setItem('dsh-desktop-auth-probed', '1');
+  var body = JSON.stringify({
+    type: 'client-request',
+    rpcId: 'desktop-auth-probe',
+    method: 'settings/describe',
+    payload: { args: {} }
+  });
+  fetch('/api/settings/describe', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'content-type': 'application/json' },
+    body: body
+  }).then(function (response) {
+    location.href = 'dsh-auth-probe://localhost/?status=' + response.status;
+  }).catch(function () {
+    location.href = 'dsh-auth-probe://localhost/?status=0';
+  });
+})();"#;
+
 #[cfg(test)]
 mod tests {
     use super::AUTH_PROBE_JS;
@@ -35,5 +58,7 @@ mod tests {
         assert!(AUTH_PROBE_JS.contains("credentials: 'include'"));
         assert!(AUTH_PROBE_JS.contains("type: 'dsh://auth-probe'"));
         assert!(AUTH_PROBE_JS.contains("location.hostname !== 'localhost'"));
+        assert!(AUTH_TOP_LEVEL_PROBE_JS.contains("window.top !== window"));
+        assert!(AUTH_TOP_LEVEL_PROBE_JS.contains("dsh-auth-probe://localhost/"));
     }
 }

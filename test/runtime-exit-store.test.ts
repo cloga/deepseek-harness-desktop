@@ -194,6 +194,8 @@ describe('runtime exit store', () => {
       }
       if (command === 'finish_harness_webview_auth')
         return undefined
+      if (command === 'show_harness_webview' || command === 'close_harness_webview')
+        return undefined
       throw new Error(`unexpected invoke: ${command}`)
     })
 
@@ -230,6 +232,8 @@ describe('runtime exit store', () => {
         finalized.push(args?.success === true)
         return undefined
       }
+      if (command === 'show_harness_webview' || command === 'close_harness_webview')
+        return undefined
       if (command === 'read_service_logs')
         return ''
       throw new Error(`unexpected invoke: ${command}`)

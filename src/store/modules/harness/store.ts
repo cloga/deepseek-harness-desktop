@@ -308,6 +308,8 @@ export const harness = defineStore({
     serviceUrl: 'http://127.0.0.1:3080',
     /** 带时间戳的 iframe 地址（boot 时生成一次，避免缓存） */
     iframeSrc: '',
+    nativeWebview: false,
+    nativeWebviewOrigin: '',
     iframeLoaded: false,
     iframeError: false,
     iframeKey: 0,
@@ -456,6 +458,10 @@ export const harness = defineStore({
 
     /** 刷新 iframe：清除加载态并延迟重新挂载 */
     refreshIframe() {
+      if (this.nativeWebview) {
+        void invoke('reload_harness_webview')
+        return
+      }
       this.iframeLoaded = false
       this.iframeError = false
       if (iframeRefreshTimer !== undefined) {
@@ -557,10 +563,14 @@ export const harness = defineStore({
       const preparation = await invoke<HarnessWebviewPreparation>('prepare_harness_webview', { generation: launchGeneration })
       if (token !== bootToken) {
         await finishHarnessWebviewClaim(preparation, false)
+        if (preparation.verify_auth)
+          await invoke('close_harness_webview')
         return false
       }
 
       this.serviceUrl = readyInfo.service_url
+      this.nativeWebview = preparation.verify_auth
+      this.nativeWebviewOrigin = preparation.probe_origin ?? ''
       const authProbe = preparation.verify_auth
         ? waitForIframeAuthProbe(preparation.probe_origin ?? new URL(preparation.url).origin)
         : undefined
@@ -571,13 +581,19 @@ export const harness = defineStore({
           await authProbe
           if (token !== bootToken) {
             await finishHarnessWebviewClaim(preparation, false)
+            await invoke('close_harness_webview')
             return false
           }
           await finishHarnessWebviewClaim(preparation, true)
+          await invoke('show_harness_webview')
+          this.markIframeLoaded()
         }
         catch (error) {
           await finishHarnessWebviewClaim(preparation, false).catch((finishError) => {
             console.error('[Harness] failed to release WebView auth claim:', finishError)
+          })
+          await invoke('close_harness_webview').catch((closeError) => {
+            console.error('[Harness] failed to close native Harness WebView:', closeError)
           })
           this.serviceHealthy = false
           this.iframeLoaded = false
@@ -629,6 +645,8 @@ export const harness = defineStore({
       this.recovery = initialRecovery
       this.dismissedRecoveryIds = []
       this.serviceHealthy = false
+      this.nativeWebview = false
+      this.nativeWebviewOrigin = ''
       this.iframeLoaded = false
       this.iframeError = false
       this.startupPhase = 'process-boot'

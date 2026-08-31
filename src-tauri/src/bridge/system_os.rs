@@ -8,7 +8,7 @@ use crate::config;
 use crate::logger;
 use crate::service::core;
 use serde::Serialize;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -41,6 +41,12 @@ pub struct HarnessWebviewPreparation {
     verify_auth: bool,
     claim: Option<crate::service::workflow::utils::HarnessLaunchClaimId>,
     probe_origin: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct HarnessAuthProbePayload {
+    origin: String,
+    status: u16,
 }
 
 #[tauri::command]
@@ -153,6 +159,132 @@ async fn start_harness_auth_relay(
         let _ = stream.shutdown().await;
     });
     Ok(format!("http://localhost:{port}{path}"))
+}
+
+#[tauri::command]
+pub async fn mount_harness_webview(
+    app_handle: AppHandle,
+    url: String,
+    probe_origin: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let relay_url = reqwest::Url::parse(&url)
+        .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?;
+    if relay_url.scheme() != "http"
+        || relay_url.host_str() != Some("localhost")
+        || !relay_url.path().starts_with("/dsh-auth/")
+    {
+        return Err("HARNESS_WEBVIEW_URL_REJECTED: expected native relay URL".into());
+    }
+    let expected_origin = reqwest::Url::parse(&probe_origin)
+        .map_err(|_| "HARNESS_WEBVIEW_ORIGIN_INVALID: probe origin is invalid".to_string())?;
+    if expected_origin.scheme() != "http"
+        || expected_origin.host_str() != Some("localhost")
+        || expected_origin.origin().ascii_serialization() != probe_origin
+    {
+        return Err("HARNESS_WEBVIEW_ORIGIN_REJECTED: expected localhost origin".into());
+    }
+    let relay_port = relay_url.port();
+    let harness_port = expected_origin.port();
+
+    if let Some(existing) = app_handle.get_webview("harness") {
+        existing
+            .close()
+            .map_err(|_| "HARNESS_WEBVIEW_CLOSE_FAILED: child WebView close failed".to_string())?;
+    }
+    let window = app_handle
+        .get_window("main")
+        .ok_or_else(|| "HARNESS_WEBVIEW_WINDOW_MISSING: main window not found".to_string())?;
+    let event_app = app_handle.clone();
+    let event_origin = probe_origin.clone();
+    let builder = tauri::webview::WebviewBuilder::new(
+        "harness",
+        WebviewUrl::External(
+            url.parse()
+                .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?,
+        ),
+    )
+    .initialization_script(crate::desktop::auth_probe::AUTH_TOP_LEVEL_PROBE_JS)
+    .on_navigation(move |target| {
+        if target.scheme() == "dsh-auth-probe" {
+            let status = target
+                .query_pairs()
+                .find_map(|(name, value)| (name == "status").then(|| value.parse::<u16>().ok()))
+                .flatten()
+                .unwrap_or(0);
+            let _ = event_app.emit(
+                "harness-auth-probe",
+                HarnessAuthProbePayload {
+                    origin: event_origin.clone(),
+                    status,
+                },
+            );
+            return false;
+        }
+        target.scheme() == "http"
+            && target.host_str() == Some("localhost")
+            && (target.port() == relay_port || target.port() == harness_port)
+    });
+    let webview = window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(x, y),
+            tauri::LogicalSize::new(width.max(1.0), height.max(1.0)),
+        )
+        .map_err(|_| "HARNESS_WEBVIEW_CREATE_FAILED: child WebView creation failed".to_string())?;
+    webview
+        .hide()
+        .map_err(|_| "HARNESS_WEBVIEW_HIDE_FAILED: child WebView hide failed".to_string())
+}
+
+#[tauri::command]
+pub fn set_harness_webview_bounds(
+    app_handle: AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let Some(webview) = app_handle.get_webview("harness") else {
+        return Ok(());
+    };
+    webview
+        .set_bounds(tauri::Rect {
+            position: tauri::Position::Logical(tauri::LogicalPosition::new(x, y)),
+            size: tauri::Size::Logical(tauri::LogicalSize::new(width.max(1.0), height.max(1.0))),
+        })
+        .map_err(|_| "HARNESS_WEBVIEW_BOUNDS_FAILED: child WebView resize failed".to_string())
+}
+
+#[tauri::command]
+pub fn show_harness_webview(app_handle: AppHandle) -> Result<(), String> {
+    app_handle
+        .get_webview("harness")
+        .ok_or_else(|| "HARNESS_WEBVIEW_MISSING: child WebView not found".to_string())?
+        .show()
+        .map_err(|_| "HARNESS_WEBVIEW_SHOW_FAILED: child WebView show failed".to_string())
+}
+
+#[tauri::command]
+pub fn close_harness_webview(app_handle: AppHandle) -> Result<(), String> {
+    if let Some(webview) = app_handle.get_webview("harness") {
+        webview
+            .close()
+            .map_err(|_| "HARNESS_WEBVIEW_CLOSE_FAILED: child WebView close failed".to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reload_harness_webview(app_handle: AppHandle) -> Result<(), String> {
+    app_handle
+        .get_webview("harness")
+        .ok_or_else(|| "HARNESS_WEBVIEW_MISSING: child WebView not found".to_string())?
+        .reload()
+        .map_err(|_| "HARNESS_WEBVIEW_RELOAD_FAILED: child WebView reload failed".to_string())
 }
 
 #[tauri::command]

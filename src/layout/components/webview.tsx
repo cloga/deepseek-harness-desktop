@@ -1,5 +1,8 @@
 /* eslint-disable react/dom-no-unsafe-iframe-sandbox */
+import type { UnlistenFn } from '@tauri-apps/api/event'
 import { CircleExclamation } from '@gravity-ui/icons'
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
@@ -19,6 +22,15 @@ const STARTUP_STATUS_KEYS = {
   'client-modules': 'status.loading_client_modules',
 } as const
 
+let harnessAuthProbeListener: Promise<UnlistenFn> | undefined
+
+function ensureHarnessAuthProbeListener() {
+  harnessAuthProbeListener ??= listen<{ origin: string, status: number }>('harness-auth-probe', (event) => {
+    store.harness.reportIframeAuthProbe(event.payload.origin, event.payload.status)
+  })
+  return harnessAuthProbeListener
+}
+
 /**
  * 主区域视图：壳层导航栏（Navbar）常驻顶部，
  * 安装/错误态渲染 Setup，就绪态渲染 iframe
@@ -34,11 +46,14 @@ export function Webview() {
     iframeError,
     iframeKey,
     iframeSrc,
+    nativeWebview,
+    nativeWebviewOrigin,
     serviceUrl,
     recovery,
   } = useStore(store.harness)
 
   const iframeRef = useRef<HTMLIFrameElement>(null)
+  const nativeWebviewRef = useRef<HTMLDivElement>(null)
 
   useDesktopZoom(iframeRef)
   useIframeShim(iframeRef)
@@ -54,7 +69,63 @@ export function Webview() {
     window.addEventListener('message', handleAuthProbe)
     return () => window.removeEventListener('message', handleAuthProbe)
   }, [])
+  useEffect(() => {
+    let disposed = false
+    let mounted = false
+    let mounting = false
+    let observer: ResizeObserver | undefined
 
+    async function syncNativeWebview() {
+      const element = nativeWebviewRef.current
+      if (disposed || !nativeWebview || !serviceHealthy || element === null)
+        return
+      const bounds = element.getBoundingClientRect()
+      const geometry = {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+      }
+      if (mounted || mounting) {
+        if (mounted)
+          await invoke('set_harness_webview_bounds', geometry)
+        return
+      }
+      mounting = true
+      try {
+        await ensureHarnessAuthProbeListener()
+        await invoke('mount_harness_webview', {
+          ...geometry,
+          url: iframeSrc,
+          probeOrigin: nativeWebviewOrigin,
+        })
+        mounted = true
+      }
+      catch (error) {
+        console.error('[Harness] failed to mount native WebView:', error)
+        store.harness.markIframeError()
+      }
+      finally {
+        mounting = false
+      }
+    }
+
+    if (nativeWebview && serviceHealthy) {
+      void syncNativeWebview()
+      observer = new ResizeObserver(() => {
+        void syncNativeWebview()
+      })
+      if (nativeWebviewRef.current !== null)
+        observer.observe(nativeWebviewRef.current)
+    }
+
+    return () => {
+      disposed = true
+      observer?.disconnect()
+      if (mounted)
+        void invoke('close_harness_webview')
+    }
+  }, [iframeKey, iframeSrc, nativeWebview, nativeWebviewOrigin, serviceHealthy])
   if (status === 'error') {
     return (
       <main className="relative flex min-h-0 flex-1 flex-col bg-canvas">
@@ -102,16 +173,22 @@ export function Webview() {
           cond={serviceHealthy}
           else={<Loadable subtitle={t(STARTUP_STATUS_KEYS[startupPhase])} />}
         >
-          <iframe
-            key={iframeKey}
-            ref={iframeRef}
-            className="block h-full w-full border-none bg-load-bg"
-            src={iframeSrc}
-            allow="accelerometer; ambient-light-sensor; autoplay; battery; camera; clipboard-read; clipboard-write; display-capture; document-domain; encrypted-media; fullscreen; gamepad; geolocation; gyroscope; hid; idle-detection; keyboard-map; magnetometer; microphone; midi; payment; picture-in-picture; publickey-credentials-get; screen-wake-lock; serial; speaker-selection; usb; web-share; xr-spatial-tracking"
-            sandbox="allow-same-origin allow-scripts allow-popups allow-forms allow-modals allow-downloads allow-storage-access-by-user-activation"
-            onLoad={store.harness.markIframeLoaded}
-            onError={store.harness.markIframeError}
-            title={t('app.open_editor')}
+          <If
+            cond={nativeWebview}
+            then={<div key={iframeKey} ref={nativeWebviewRef} className="h-full w-full bg-load-bg" />}
+            else={(
+              <iframe
+                key={iframeKey}
+                ref={iframeRef}
+                className="block h-full w-full border-none bg-load-bg"
+                src={iframeSrc}
+                allow="accelerometer; ambient-light-sensor; autoplay; battery; camera; clipboard-read; clipboard-write; display-capture; document-domain; encrypted-media; fullscreen; gamepad; geolocation; gyroscope; hid; idle-detection; keyboard-map; magnetometer; microphone; midi; payment; picture-in-picture; publickey-credentials-get; screen-wake-lock; serial; speaker-selection; usb; web-share; xr-spatial-tracking"
+                sandbox="allow-same-origin allow-scripts allow-popups allow-forms allow-modals allow-downloads allow-storage-access-by-user-activation"
+                onLoad={store.harness.markIframeLoaded}
+                onError={store.harness.markIframeError}
+                title={t('app.open_editor')}
+              />
+            )}
           />
         </If>
 
