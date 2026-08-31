@@ -35,8 +35,9 @@ pub(crate) const AUTH_TOP_LEVEL_PROBE_JS: &str = r#"(function () {
       || timestamps.length !== 1
       || !/^\d+$/.test(timestamps[0])) return;
   }
-  if (sessionStorage.getItem('dsh-desktop-auth-probed') === '1') return;
-  sessionStorage.setItem('dsh-desktop-auth-probed', '1');
+  var probePage = location.pathname + location.search;
+  if (sessionStorage.getItem('dsh-desktop-auth-probed') === probePage) return;
+  sessionStorage.setItem('dsh-desktop-auth-probed', probePage);
   var body = JSON.stringify({
     type: 'client-request',
     rpcId: 'desktop-auth-probe',
@@ -71,6 +72,7 @@ mod tests {
         assert!(AUTH_TOP_LEVEL_PROBE_JS.contains("name !== 't'"));
         assert!(AUTH_TOP_LEVEL_PROBE_JS.contains("timestamps.length !== 1"));
         assert!(AUTH_TOP_LEVEL_PROBE_JS.contains(r"!/^\d+$/"));
+        assert!(AUTH_TOP_LEVEL_PROBE_JS.contains("location.pathname + location.search"));
         assert!(!AUTH_TOP_LEVEL_PROBE_JS.contains("location.search !== '' ||"));
     }
 }

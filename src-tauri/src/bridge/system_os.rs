@@ -200,7 +200,22 @@ pub async fn mount_harness_webview(
         "[harness-webview] mount requested: relay={is_relay}, origin={probe_origin}, bounds={x},{y},{width},{height}"
     );
 
+    let destination: tauri::Url = url
+        .parse()
+        .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?;
     if let Some(existing) = app_handle.get_webview("harness") {
+        let reusable = is_clean_core
+            && existing
+                .url()
+                .map(|current| current.origin() == expected_origin.origin())
+                .unwrap_or(false);
+        if reusable {
+            log::info!("[harness-webview] reusing authenticated child");
+            existing.navigate(destination).map_err(|_| {
+                "HARNESS_WEBVIEW_NAVIGATE_FAILED: child WebView navigation failed".to_string()
+            })?;
+            return Ok(());
+        }
         existing
             .close()
             .map_err(|_| "HARNESS_WEBVIEW_CLOSE_FAILED: child WebView close failed".to_string())?;
@@ -210,9 +225,6 @@ pub async fn mount_harness_webview(
         .ok_or_else(|| "HARNESS_WEBVIEW_WINDOW_MISSING: main window not found".to_string())?;
     let event_app = app_handle.clone();
     let event_origin = probe_origin.clone();
-    let destination = url
-        .parse()
-        .map_err(|_| "HARNESS_WEBVIEW_URL_INVALID: relay URL is invalid".to_string())?;
     let builder = tauri::webview::WebviewBuilder::new("harness", WebviewUrl::External(destination))
         .initialization_script(crate::desktop::auth_probe::AUTH_TOP_LEVEL_PROBE_JS)
         .on_navigation(move |target| {
@@ -634,6 +646,28 @@ mod tests {
         assert!(mount.contains("WebviewUrl::External(destination)"));
         let post_create_navigation = ["webview", ".navigate(destination)"].concat();
         assert!(!mount.contains(&post_create_navigation));
+    }
+
+    #[test]
+    fn clean_retry_reuses_authenticated_child_before_close_fallback() {
+        let source = include_str!("system_os.rs");
+        let mount = source
+            .split("pub async fn mount_harness_webview")
+            .nth(1)
+            .and_then(|tail| tail.split("#[tauri::command]").next())
+            .expect("mount_harness_webview function source");
+        let reuse = mount
+            .find("[harness-webview] reusing authenticated child")
+            .expect("authenticated child reuse");
+        let navigate = mount[reuse..]
+            .find("existing.navigate(destination)")
+            .map(|index| reuse + index)
+            .expect("clean retry navigation");
+        let close = mount
+            .find("existing\n            .close()")
+            .expect("replacement close fallback");
+        assert!(reuse < navigate);
+        assert!(navigate < close);
     }
 
     #[test]
