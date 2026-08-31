@@ -44,6 +44,12 @@ pub struct DshPlugin {
     pub repo_url: String,
     /// 是否在 `dsh.profile.bundles` 中（启动时自动加载）
     pub bundled: bool,
+    /// 是否在禁用清单（`disabled-plugins.json`）中。
+    ///
+    /// 与 `bundled` 独立：已安装但不在 `bundles` 中的插件，仅当同时存在于
+    /// 禁用清单时才视为「已禁用」；否则为「未加载」（用户未主动禁用，
+    /// 启用操作会返回 `ENABLE_NOT_DISABLED`，前端不应展示启用入口）。
+    pub disabled: bool,
     /// 预设清单中的「推荐」标记（绿色 chip）
     pub recommended: bool,
     /// 预设清单中的「修复」标记（黄色 chip）
@@ -145,6 +151,10 @@ fn parse_plugins(profile: &Path, presets: &[PreinstallPluginInfo]) -> Vec<DshPlu
         .map(|p| installed_name(p).to_string())
         .collect();
 
+    // 禁用清单：用于区分「已禁用」（用户主动禁用）与「未加载」（不在 bundles
+    // 但也不在禁用清单，启用会返回 ENABLE_NOT_DISABLED）。
+    let disabled_map = crate::service::plugin::disable::load_disabled(profile);
+
     let mut dep_ids: Vec<&String> = manifest.dependencies.keys().collect();
     // 稳定排序：启动加载（bundles）的插件在前，其余按 id 字典序
     dep_ids.sort_by_key(|id| (!bundled.contains(id.as_str()), id.as_str()));
@@ -182,6 +192,7 @@ fn parse_plugins(profile: &Path, presets: &[PreinstallPluginInfo]) -> Vec<DshPlu
                     .unwrap_or_default(),
                 repo_url,
                 bundled: bundled.contains(id.as_str()),
+                disabled: disabled_map.contains_key(id),
                 recommended: preset.map(|p| p.recommended).unwrap_or(false),
                 fix: preset.map(|p| p.fix).unwrap_or(false),
                 internal: internal_names.contains(id.as_str()),
@@ -470,6 +481,7 @@ mod tests {
             description: String::new(),
             repo_url: String::new(),
             bundled: true,
+            disabled: false,
             recommended: false,
             fix: false,
             internal: false,
@@ -500,6 +512,7 @@ mod tests {
             description: String::new(),
             repo_url: String::new(),
             bundled: true,
+            disabled: false,
             recommended: false,
             fix: false,
             internal: false,
@@ -541,6 +554,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(parse_plugins(&dir, &[]).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 覆盖 `disabled` 字段的状态组合：
+    /// - 在 bundles 且不在禁用清单 → bundled=true, disabled=false（正常加载）
+    /// - 不在 bundles 但在禁用清单 → bundled=false, disabled=true（已禁用，可启用）
+    /// - 不在 bundles 且不在禁用清单 → bundled=false, disabled=false（未加载，启用会失败）
+    #[test]
+    fn parse_plugins_distinguishes_disabled_from_unloaded() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-watch-disabled-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir.join("node_modules")).unwrap();
+        let manifest = serde_json::json!({
+            "name": "dsh-profile-web",
+            "private": true,
+            "dependencies": {
+                "dsh-loaded": "1.0.0",
+                "dsh-disabled": "1.0.0",
+                "dsh-unloaded": "1.0.0"
+            },
+            "dsh": { "profile": { "bundles": ["dsh-loaded"] } }
+        });
+        std::fs::write(
+            dir.join("package.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        for id in ["dsh-loaded", "dsh-disabled", "dsh-unloaded"] {
+            let pkg_dir = dir.join("node_modules").join(id);
+            std::fs::create_dir_all(&pkg_dir).unwrap();
+            std::fs::write(pkg_dir.join("package.json"), format!(r#"{{"name":"{id}"}}"#)).unwrap();
+        }
+        // 仅 dsh-disabled 写入禁用清单。
+        let disabled = serde_json::json!({
+            "dsh-disabled": { "disabledAt": "1700000000", "reason": "user" }
+        });
+        std::fs::write(
+            dir.join("disabled-plugins.json"),
+            serde_json::to_string_pretty(&disabled).unwrap(),
+        )
+        .unwrap();
+
+        let plugins = parse_plugins(&dir, &[]);
+        let loaded = plugins.iter().find(|p| p.id == "dsh-loaded").unwrap();
+        assert!(loaded.bundled);
+        assert!(!loaded.disabled);
+        let disabled_plugin = plugins.iter().find(|p| p.id == "dsh-disabled").unwrap();
+        assert!(!disabled_plugin.bundled);
+        assert!(disabled_plugin.disabled);
+        let unloaded = plugins.iter().find(|p| p.id == "dsh-unloaded").unwrap();
+        assert!(!unloaded.bundled);
+        assert!(!unloaded.disabled);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -4,7 +4,7 @@ import { Button, Checkbox, Chip, Label, Spinner, Typography } from '@heroui/reac
 import { invoke } from '@tauri-apps/api/core'
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { If } from 'react-if-lite'
+import { Else, If, Then } from 'react-if-lite'
 import { useStore } from 'valtio-define'
 import { Empty } from '@/components/empty'
 import { Item } from '@/components/item'
@@ -241,20 +241,40 @@ export function PreinstallSetup() {
                     </If>
                   </div>
 
-                  {/* 操作区：跳过 / 确定 */}
+                  {/* 可取消勾选提示：让用户知道预设插件可减选，取消后不会安装 */}
+                  <If cond={preinstall.plugins.length > 0 && !installing && preinstall.error === ''}>
+                    <p className="text-center text-xs text-muted">{t('preinstall.can_uncheck_hint')}</p>
+                  </If>
+
+                  {/* 操作区：跳过 / 确定（空选时主按钮蜕变为「跳过」） */}
                   <div className="flex items-center justify-end gap-2">
                     <Button className="h-8 rounded-md" size="sm" variant="tertiary" onPress={handleSkip} isDisabled={installing}>
                       {t('preinstall.skip')}
                     </Button>
-                    <Button
-                      className="h-8 rounded-md"
-                      size="sm"
-                      variant="primary"
-                      onPress={handleConfirm}
-                      isDisabled={installing || selectedCount === 0 || selectableCount === 0}
-                    >
-                      {t('preinstall.confirm')}
-                    </Button>
+                    <If cond={selectedCount === 0}>
+                      <Then>
+                        <Button
+                          className="h-8 rounded-md"
+                          size="sm"
+                          variant="primary"
+                          onPress={handleSkip}
+                          isDisabled={installing || selectableCount === 0}
+                        >
+                          {t('preinstall.skip')}
+                        </Button>
+                      </Then>
+                      <Else>
+                        <Button
+                          className="h-8 rounded-md"
+                          size="sm"
+                          variant="primary"
+                          onPress={handleConfirm}
+                          isDisabled={installing || selectableCount === 0}
+                        >
+                          {t('preinstall.confirm')}
+                        </Button>
+                      </Else>
+                    </If>
                   </div>
                 </>
               )}

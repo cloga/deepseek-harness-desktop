@@ -8,11 +8,14 @@ import { If } from 'react-if-lite'
 import { store } from '@/store'
 import { toast } from '@/utils/toast'
 import { useDshProfiles } from '../hooks/use-dsh-profiles'
+import { ConfigBackup } from './config-backup'
 import { Ellipsis } from './ellipsis'
 import { Item } from './item'
 import { Modal } from './modal'
 import { PanelHeader } from './panel-header'
 import { PanelState } from './panel-state'
+
+type ProfileView = 'list' | { profile: string }
 
 export function ConfigProfile() {
   /**
@@ -30,6 +33,7 @@ export function ConfigProfile() {
   const { t } = useTranslation()
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
+  const [activeView, setActiveView] = useState<ProfileView>('list')
 
   async function activate(id: string) {
     const target = profiles.find(p => p.id === id)
@@ -125,6 +129,13 @@ export function ConfigProfile() {
     }
   }
 
+  // 备份子视图：点击档案的「备份」芯片后进入
+  if (activeView !== 'list') {
+    return (
+      <ConfigBackup onBack={() => setActiveView('list')} />
+    )
+  }
+
   return (
     <div className="space-y-3">
       <PanelHeader title={t('profiles.title')} description={t('profiles.tooltip')} />
@@ -150,6 +161,18 @@ export function ConfigProfile() {
               )}
               right={(
                 <>
+                  <Chip
+                    className="rounded-md mr-1"
+                    variant="secondary"
+                    color="accent"
+                    size="sm"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      setActiveView({ profile: profile.id })
+                    }}
+                  >
+                    {t('backup.manage')}
+                  </Chip>
                   <Checkbox
                     isSelected={profile.active}
                     isDisabled={busy}

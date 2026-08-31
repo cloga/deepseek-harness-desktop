@@ -7,6 +7,12 @@ export interface AppConfig {
   cli_link_enabled: boolean
   zoom_factor: number
   close_action: string
+  auto_backup_enabled: boolean
+  auto_backup_interval_days: number
+  auto_backup_on_startup: boolean
+  auto_backup_on_change: boolean
+  backup_retention_count: number
+  backup_include_credentials: boolean
 }
 
 /// 共享的 app 配置查询：config-close-action 与 config-debug 共用同一份

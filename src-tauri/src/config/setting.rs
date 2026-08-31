@@ -56,6 +56,24 @@ pub struct Setting {
     /// 默认，严格 enum 的一个意外值会连带清空端口/语言/档案等全部设置。
     #[serde(default = "default_close_action")]
     pub close_action: String,
+    /// 是否启用自动备份。
+    #[serde(default)]
+    pub auto_backup_enabled: bool,
+    /// 自动备份间隔（天）。
+    #[serde(default = "default_auto_backup_interval_days")]
+    pub auto_backup_interval_days: u32,
+    /// 是否在每次启动时自动备份。
+    #[serde(default)]
+    pub auto_backup_on_startup: bool,
+    /// 是否在配置变化时自动备份。
+    #[serde(default)]
+    pub auto_backup_on_change: bool,
+    /// 最多保留备份份数。
+    #[serde(default = "default_backup_retention_count")]
+    pub backup_retention_count: u32,
+    /// 备份是否包含凭据文件（`.credentials.yaml`）。
+    #[serde(default)]
+    pub backup_include_credentials: bool,
 }
 
 pub const ZOOM_FACTOR_MIN: f64 = 0.5;
@@ -82,6 +100,16 @@ pub fn default_close_action() -> String {
     "tray".to_string()
 }
 
+/// 自动备份默认间隔：7 天。
+pub fn default_auto_backup_interval_days() -> u32 {
+    7
+}
+
+/// 默认保留备份份数：10 份。
+pub fn default_backup_retention_count() -> u32 {
+    10
+}
+
 /// 把外部或旧存储中的关闭行为收敛到白名单，未知值一律回落到默认行为。
 ///
 /// 只做精确匹配：不做 `trim()`、不做大小写折叠——store 可被手工编辑、旧版本或其它
@@ -101,6 +129,34 @@ pub fn normalize_zoom_factor(value: f64) -> f64 {
     let clamped = value.clamp(ZOOM_FACTOR_MIN, ZOOM_FACTOR_MAX);
     let steps_per_unit = 1.0 / ZOOM_FACTOR_STEP;
     (clamped * steps_per_unit).round() / steps_per_unit
+}
+
+/// 归一化自动备份设置：把间隔和保留份数限制在有效范围内。
+///
+/// - `interval_days` 限制在 [1, 90]，未知/越界回落默认 7。
+/// - `retention_count` 限制在 [1, 50]，未知/越界回落默认 10。
+pub fn normalize_backup_settings(interval_days: u32, retention_count: u32) -> (u32, u32) {
+    let interval = if interval_days == 0 || interval_days > 90 {
+        default_auto_backup_interval_days()
+    } else {
+        interval_days
+    };
+    let retention = if retention_count == 0 || retention_count > 50 {
+        default_backup_retention_count()
+    } else {
+        retention_count
+    };
+    (interval, retention)
+}
+
+/// 把 Setting 的备份字段归一化到有效范围。
+fn normalize_backup_fields(setting: &mut Setting) {
+    let (interval, retention) = normalize_backup_settings(
+        setting.auto_backup_interval_days,
+        setting.backup_retention_count,
+    );
+    setting.auto_backup_interval_days = interval;
+    setting.backup_retention_count = retention;
 }
 
 /// 默认服务端口：debug 构建与生产隔离，避免开发时与已运行的桌面端争用 3080。
@@ -130,6 +186,12 @@ impl Default for Setting {
             manual_port: None,
             zoom_factor: default_zoom_factor(),
             close_action: default_close_action(),
+            auto_backup_enabled: false,
+            auto_backup_interval_days: default_auto_backup_interval_days(),
+            auto_backup_on_startup: false,
+            auto_backup_on_change: false,
+            backup_retention_count: default_backup_retention_count(),
+            backup_include_credentials: false,
         }
     }
 }
@@ -168,6 +230,7 @@ fn read_store_dat_setting<R: Runtime>(app_handle: &AppHandle<R>) -> Setting {
         .unwrap_or_else(Setting::default);
     setting.zoom_factor = normalize_zoom_factor(setting.zoom_factor);
     setting.close_action = normalize_close_action(&setting.close_action);
+    normalize_backup_fields(&mut setting);
     setting
 }
 
@@ -195,13 +258,14 @@ fn preserve_persisted_fields(mut replacement: Setting, current: &Setting) -> Set
 
 /// 兼容旧调用方的整对象写入，但始终保留锁内读到的最新缩放与关窗动作，避免
 /// 长流程用陈旧 `Setting` 覆盖刚刚由快捷键 / 设置界面写入的值（丢更新）。
-pub fn set_store_dat_setting(app_handle: &AppHandle, setting: Setting) {
+pub fn set_store_dat_setting(app_handle: &AppHandle, mut setting: Setting) {
     let value = {
         let _guard = setting_write_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let current = read_store_dat_setting(app_handle);
-        let setting = preserve_persisted_fields(setting, &current);
+        setting = preserve_persisted_fields(setting, &current);
+        normalize_backup_fields(&mut setting);
         write_store_dat_setting(app_handle, &setting)
     };
     emit_setting(app_handle, &value);
@@ -221,6 +285,7 @@ where
         setting.zoom_factor = normalize_zoom_factor(setting.zoom_factor);
         // 落盘前的第二道闸：调用方（含前端 invoke）写入的不可信取值不以原始形态进 store
         setting.close_action = normalize_close_action(&setting.close_action);
+        normalize_backup_fields(&mut setting);
         let value = write_store_dat_setting(app_handle, &setting);
         (setting, value)
     };

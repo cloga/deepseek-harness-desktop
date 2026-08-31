@@ -103,6 +103,8 @@ pub async fn update_app_config(
             setting.close_action = action;
         }
     });
+    // 配置变化后，若开启了「配置变化时备份」，标记待执行（由 scheduler tick 去抖后执行）
+    crate::service::backup::schedule::mark_config_changed(&app_handle);
     Ok(setting)
 }
 

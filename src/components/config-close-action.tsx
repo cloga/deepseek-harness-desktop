@@ -1,6 +1,6 @@
 import type { AppConfig } from '@/hooks/use-app-config'
 import { Description, ListBox, Select } from '@heroui/react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { invoke } from '@tauri-apps/api/core'
 import { useTranslation } from 'react-i18next'
 import { useAppConfig } from '@/hooks/use-app-config'
@@ -14,10 +14,15 @@ const CLOSE_ACTION_LABEL_KEYS = {
 
 export function ConfigCloseAction() {
   const { t } = useTranslation()
+  const queryClient = useQueryClient()
   const { data: config, refetch, isFetching } = useAppConfig()
   const { mutate: setCloseAction, isPending } = useMutation({
     mutationFn: async (closeAction: string) => {
       const next = normalizeCloseAction(closeAction)
+      // 先写入成功结果到缓存：即使后续 refetch 失败，UI 仍展示新值，
+      // 避免回退到更新前的旧 close_action（refetch 默认不抛错，只保留旧数据）。
+      const result = await invoke<AppConfig>('update_app_config', { closeAction: next })
+      queryClient.setQueryData(['config'], result)
       await invoke<AppConfig>('update_app_config', { closeAction: next })
       await refetch()
     },

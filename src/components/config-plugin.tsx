@@ -6,6 +6,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
+import { tv } from 'tailwind-variants'
 import { useStore } from 'valtio-define'
 import { store } from '@/store'
 import { toast } from '@/utils/toast'
@@ -16,6 +17,23 @@ import { Item } from './item'
 import { Modal } from './modal'
 import { PanelHeader } from './panel-header'
 import { PanelState } from './panel-state'
+
+/**
+ * 操作 chip 的样式变体：busy 时禁止点击并降低透明度，否则可点击。
+ * 统一各操作 chip 的 busy 样式，避免内联三元重复。
+ */
+const actionChip = tv({
+  base: 'rounded-md',
+  variants: {
+    busy: {
+      true: 'cursor-not-allowed opacity-50',
+      false: 'cursor-pointer',
+    },
+  },
+  defaultVariants: {
+    busy: false,
+  },
+})
 
 /**
  * 「插件」面板：展示已安装插件，作为「插件出问题时」的卸载/升级入口。
@@ -31,13 +49,13 @@ import { PanelState } from './panel-state'
 export function ConfigPlugin() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
-  const { plugins, loading, error } = useDshPlugins()
+  const { plugins, loading, error, disablePlugin, enablePlugin } = useDshPlugins()
   const { preinstall } = useStore(store.harness)
 
   const [dialogHolder, openDialog] = useOverlay(Modal, { type: 'holder' })
 
-  /** 行内操作进行中状态：id + 操作类型（update/remove），保证单例运行 */
-  const [busy, setBusy] = useState<{ id: string, action: 'update' | 'remove' } | null>(null)
+  /** 行内操作进行中状态：id + 操作类型（update/remove/disable/enable），保证单例运行 */
+  const [busy, setBusy] = useState<{ id: string, action: 'update' | 'remove' | 'disable' | 'enable' } | null>(null)
 
   const upgrade = useMutation({
     mutationFn: (id: string) => invoke<void>('update_dsh_plugin', { id }),
@@ -66,6 +84,32 @@ export function ConfigPlugin() {
       const name = plugins.find(p => p.id === id)?.name ?? id
       console.error('[ConfigPlugin] remove failed:', err)
       toast(t('plugins.remove_failed', { name }), {})
+    },
+  })
+  const disable = useMutation({
+    mutationFn: (id: string) => disablePlugin(id),
+    onSuccess: (_data, id) => {
+      const name = plugins.find(p => p.id === id)?.name ?? id
+      void queryClient.invalidateQueries({ queryKey: ['plugins'] })
+      toast(t('plugins.disable_toast', { name }), {})
+    },
+    onError: (err, id) => {
+      const name = plugins.find(p => p.id === id)?.name ?? id
+      console.error('[ConfigPlugin] disable failed:', err)
+      toast(t('plugins.disable_failed', { name }), {})
+    },
+  })
+  const enable = useMutation({
+    mutationFn: (id: string) => enablePlugin(id),
+    onSuccess: (_data, id) => {
+      const name = plugins.find(p => p.id === id)?.name ?? id
+      void queryClient.invalidateQueries({ queryKey: ['plugins'] })
+      toast(t('plugins.enable_toast', { name }), {})
+    },
+    onError: (err, id) => {
+      const name = plugins.find(p => p.id === id)?.name ?? id
+      console.error('[ConfigPlugin] enable failed:', err)
+      toast(t('plugins.enable_failed', { name }), {})
     },
   })
 
@@ -115,6 +159,41 @@ export function ConfigPlugin() {
     finally {
       setBusy(null)
       // 同上：卸载后统一拉起服务，避免服务被后端停止后前端状态过期。
+      void store.harness.restart()
+    }
+  }
+
+  async function onDisable(id: string) {
+    if (busy)
+      return
+    // 禁用是可逆操作（保留包体，启用即可恢复），无需确认对话框。
+    setBusy({ id, action: 'disable' })
+    try {
+      await disable.mutateAsync(id)
+    }
+    catch {
+      // 错误提示已由 mutation 的 onError 处理
+    }
+    finally {
+      setBusy(null)
+      // 禁用后统一拉起服务，使新的 bundles 列表生效。
+      void store.harness.restart()
+    }
+  }
+
+  async function onEnable(id: string) {
+    if (busy)
+      return
+    setBusy({ id, action: 'enable' })
+    try {
+      await enable.mutateAsync(id)
+    }
+    catch {
+      // 错误提示已由 mutation 的 onError 处理
+    }
+    finally {
+      setBusy(null)
+      // 启用后统一拉起服务，使新的 bundles 列表生效。
       void store.harness.restart()
     }
   }
@@ -189,10 +268,20 @@ export function ConfigPlugin() {
                           {plugin.version}
                         </code>
                       </If>
+                      <If cond={!plugin.internal && plugin.recommended}>
+                        <Chip size="sm" variant="soft" color="success" className="shrink-0 font-medium">
+                          {t('plugins.preset')}
+                        </Chip>
+                      </If>
                       <If cond={plugin.internal}>
                         <code className="shrink-0 rounded bg-default px-1.5 py-0.5 font-mono text-[10px] text-muted">
                           {t('plugins.builtin')}
                         </code>
+                      </If>
+                      <If cond={plugin.disabled}>
+                        <Chip size="sm" variant="soft" color="default">
+                          {t('plugins.disabled_badge')}
+                        </Chip>
                       </If>
                     </div>
                     <If cond={plugin.description !== ''}>
@@ -208,7 +297,7 @@ export function ConfigPlugin() {
                         与文档 P1「对 dshmarket 点击升级」一致，且不会常驻——up-to-date 插件不显示升级按钮 */}
                     <If cond={plugin.updateAvailable || plugin.error != null}>
                       <Chip
-                        className={`rounded-md${busy ? ' cursor-not-allowed opacity-50' : ' cursor-pointer'}`}
+                        className={actionChip({ busy: !!busy })}
                         variant="primary"
                         color="accent"
                         size="sm"
@@ -225,8 +314,34 @@ export function ConfigPlugin() {
                       </Chip>
                     </If>
                     <If cond={!plugin.internal}>
+                      <If cond={plugin.disabled}>
+                        <Chip
+                          className={actionChip({ busy: !!busy })}
+                          variant="primary"
+                          color="accent"
+                          size="sm"
+                          onClick={() => onEnable(plugin.id)}
+                        >
+                          <span className="flex items-center gap-1">
+                            <If cond={busy?.id === plugin.id && busy.action === 'enable'} then={<Spinner size="sm" color="current" />} />
+                            {t('plugins.enable')}
+                          </span>
+                        </Chip>
+                      </If>
+                      <If cond={!plugin.disabled}>
+                        <Chip
+                          className={actionChip({ busy: !!busy })}
+                          size="sm"
+                          onClick={() => onDisable(plugin.id)}
+                        >
+                          <span className="flex items-center gap-1">
+                            <If cond={busy?.id === plugin.id && busy.action === 'disable'} then={<Spinner size="sm" color="current" />} />
+                            {t('plugins.disable')}
+                          </span>
+                        </Chip>
+                      </If>
                       <Chip
-                        className={`rounded-md${busy ? ' cursor-not-allowed opacity-50' : ' cursor-pointer'}`}
+                        className={actionChip({ busy: !!busy })}
                         variant="primary"
                         color="danger"
                         size="sm"
