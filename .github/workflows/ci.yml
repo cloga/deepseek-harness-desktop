@@ -128,9 +128,8 @@ jobs:
     if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
     runs-on: windows-latest
     env:
-      DSH_HOME: ${{ github.workspace }}\.e2e\dsh-home
       DSH_CLI_PATH: ${{ github.workspace }}\test\e2e\local-core\dsh.cmd
-      DSH_E2E_APPLICATION: ${{ github.workspace }}\src-tauri\target\release\deepseek-harness-desktop.exe
+      DSH_E2E_APPLICATION: ${{ github.workspace }}\src-tauri\target\debug\deepseek-harness-desktop.exe
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -151,8 +150,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build real desktop app
-        run: pnpm exec tauri build --no-bundle
+      - name: Build WebDriver-enabled desktop app
+        run: pnpm exec tauri build --debug --no-bundle
 
       - name: Install tauri-driver
         run: cargo install tauri-driver --locked
@@ -160,13 +159,14 @@ jobs:
       - name: Prepare isolated desktop state
         shell: pwsh
         run: |
-          $appData = Join-Path $env:APPDATA 'io.github.hairyf.deepseek-harness-desktop'
+          $appData = Join-Path $env:APPDATA 'io.github.hairyf.deepseek-harness-desktop\dev'
           $managed = Join-Path $appData 'dependencies\dsh\node_modules\@deepseek-ai\dsh'
+          $dshHome = Join-Path $env:USERPROFILE '.dsh.dev'
           New-Item -ItemType Directory -Force -Path (Join-Path $managed 'lib') | Out-Null
-          Copy-Item test\e2e\store.dat (Join-Path $appData '.store.dat')
+          Copy-Item test\e2e\store.dat (Join-Path $appData '.store.dev.dat')
           Copy-Item test\e2e\local-core\node_modules\@deepseek-ai\dsh\package.json $managed
           Copy-Item test\e2e\local-core\node_modules\@deepseek-ai\dsh\lib\bin.js (Join-Path $managed 'lib\bin.js')
-          New-Item -ItemType Directory -Force -Path $env:DSH_HOME | Out-Null
+          New-Item -ItemType Directory -Force -Path $dshHome | Out-Null
 
       - name: Run fresh native WebView flow
         shell: pwsh
