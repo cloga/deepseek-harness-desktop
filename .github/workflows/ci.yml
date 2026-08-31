@@ -187,10 +187,34 @@ jobs:
           if (-not $edgeDriver) {
             throw 'msedgedriver.exe is not available on the Windows runner'
           }
+          $edgeVersion = (Get-Item $edgeDriver).VersionInfo.FileVersion
+          $webViewVersion = Get-ItemPropertyValue `
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F1E7EFC4-4D73-4C4C-8F5D-C36C7D1A5A70}' `
+            -Name pv -ErrorAction SilentlyContinue
+          Write-Host "EdgeDriver: $edgeDriver ($edgeVersion)"
+          Write-Host "WebView2 runtime: $webViewVersion"
+
+          function Write-SanitizedLog([string] $Path) {
+            if (-not (Test-Path $Path)) {
+              return
+            }
+            Write-Host "::group::$Path"
+            Get-Content $Path -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                $_ `
+                  -replace '(?i)([?&](?:token|desktopToken)=)[^&\s"]+', '$1[REDACTED]' `
+                  -replace '(?i)(Authorization:\s*(?:Bearer\s+)?)[^\s"]+', '$1[REDACTED]' `
+                  -replace '(?i)(Cookie:\s*)[^\r\n]+', '$1[REDACTED]'
+              } |
+              Select-Object -Last 500
+            Write-Host '::endgroup::'
+          }
+
           $driverOut = Join-Path $env:RUNNER_TEMP 'tauri-driver.stdout.log'
           $driverErr = Join-Path $env:RUNNER_TEMP 'tauri-driver.stderr.log'
           $driver = Start-Process tauri-driver -ArgumentList '--native-driver', $edgeDriver -PassThru `
             -RedirectStandardOutput $driverOut -RedirectStandardError $driverErr
+          $testExitCode = 0
           try {
             for ($attempt = 0; $attempt -lt 60; $attempt++) {
               if (Test-NetConnection 127.0.0.1 -Port 4444 -InformationLevel Quiet -WarningAction SilentlyContinue) {
@@ -199,12 +223,40 @@ jobs:
               Start-Sleep -Milliseconds 250
             }
             pnpm run test:e2e:native
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-            }
+            $testExitCode = $LASTEXITCODE
+          }
+          catch {
+            Write-Host "::error::$($_.Exception.Message)"
+            $testExitCode = 1
           }
           finally {
-            Stop-Process -Id $driver.Id -ErrorAction SilentlyContinue
-            Get-Content $driverOut -ErrorAction SilentlyContinue
-            Get-Content $driverErr -ErrorAction SilentlyContinue
+            $appProcesses = Get-CimInstance Win32_Process |
+              Where-Object { $_.ExecutablePath -eq $env:DSH_E2E_APPLICATION }
+            if ($appProcesses) {
+              $appProcesses |
+                Select-Object ProcessId, ParentProcessId, CreationDate, ExecutablePath |
+                Format-List
+            }
+            else {
+              Write-Host 'Desktop process is not running after the session failure.'
+            }
+
+            if (-not $driver.HasExited) {
+              Stop-Process -Id $driver.Id -ErrorAction SilentlyContinue
+              $driver.WaitForExit(10000)
+            }
+            Write-SanitizedLog $driverOut
+            Write-SanitizedLog $driverErr
+
+            $desktopData = Join-Path $env:APPDATA 'io.github.hairyf.deepseek-harness-desktop'
+            @(
+              (Join-Path $desktopData 'logs\desktop.log'),
+              (Join-Path $desktopData 'logs\desktop.frontdesk.log'),
+              (Join-Path $desktopData 'dev\logs\desktop.log'),
+              (Join-Path $desktopData 'dev\logs\desktop.frontdesk.log'),
+              (Join-Path $desktopData 'dev\logs\dsh-web.dev.log')
+            ) | ForEach-Object { Write-SanitizedLog $_ }
+          }
+          if ($testExitCode -ne 0) {
+            exit $testExitCode
           }
